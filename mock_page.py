@@ -509,6 +509,13 @@ renderSetup();
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--standalone", action="store_true",
+                    help="also write a complete .html file that opens by "
+                         "double-clicking, with no login and no hosting")
+    args = ap.parse_args()
+
     data = collect()
     blob = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
     # ensure_ascii keeps the payload pure ASCII using \uXXXX escapes, which are
@@ -521,6 +528,18 @@ def main():
     OUT.write_text(doc, encoding="ascii")
     print(f"wrote {OUT}  ({len(doc)/1024:.0f} KB, {len(data['board'])} players, "
           f"{len(data['managers'])} managers)")
+
+    if args.standalone:
+        # The hosted copy is a fragment: the host supplies <head> and <body>.
+        # This one carries its own, so it can be emailed or dropped in a chat
+        # and opened by anyone with a browser -- no account, no permissions.
+        full = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,'
+                'initial-scale=1">' + doc.replace("<title>", "<title>", 1) +
+                "</body></html>").replace("<style>", "</head><body><style>", 1)
+        alt = OUT.with_name("mock-draft-standalone.html")
+        alt.write_text(full, encoding="ascii")
+        print(f"wrote {alt}  ({len(full)/1024:.0f} KB) -- send this file to anyone")
 
 
 if __name__ == "__main__":
