@@ -162,8 +162,24 @@ details.key summary{cursor:pointer;font-weight:600;color:var(--ink-2)}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
-<div class="wrap" id="app"></div>
+<div class="wrap" id="app">Loading&hellip;</div>
 <script>
+(function(){
+"use strict";
+// Everything is wrapped and wired with addEventListener rather than inline
+// onclick attributes: a host page may serve a Content-Security-Policy that
+// permits a <script> block but still blocks inline handlers, which would leave
+// every button dead with no visible reason.
+function fail(e){
+  try{
+    var a=document.getElementById("app");
+    if(a) a.innerHTML='<h1>Something went wrong</h1><p class="sub">'+
+      String((e&&e.message)||e)+'</p><pre class="note" style="white-space:pre-wrap">'+
+      String((e&&e.stack)||"")+'</pre>';
+  }catch(_){}
+}
+window.addEventListener("error",function(ev){ fail(ev.error||ev.message); });
+try{
 const DATA = __DATA__;
 
 const PRESETS = {
@@ -300,7 +316,7 @@ function poolHTML(live){
     const list=DATA.board.filter(p=>p.p===pos && !S.taken.has(p.i)).slice(0,8);
     if(!list.length) return '';
     return '<div><h3>'+pos+'</h3>'+list.map(a=>
-      '<div class="av c'+pos+'"'+(live?' onclick="take(\''+a.i+'\')"':'')+'>'+
+      '<div class="av c'+pos+'"'+(live?' data-act="take" data-arg="'+esc(a.i)+'"':'')+'>'+
       '<span>'+esc(a.n)+'</span><span class="v">'+a.v.toFixed(0)+'</span></div>').join('')+'</div>';
   }).join('')+'</div>';
 }
@@ -391,7 +407,7 @@ function render(){
     app.innerHTML='<h1>Draft complete</h1><p class="sub">'+esc(S.me)+
       ' &middot; slot '+S.slot+' &middot; '+PRESETS[S.preset].label+'</p>'+
       summary()+'<h2>Draft board</h2>'+boardHTML()+
-      '<p style="margin-top:20px"><button class="primary" onclick="reset()">Run another</button></p>';
+      '<p style="margin-top:20px"><button class="primary" data-act="reset">Run another</button></p>';
     return;
   }
   const r=recommend();
@@ -414,15 +430,15 @@ function render(){
         :'<div class="wait">'+esc(onClock)+' is picking&hellip;</div>')+
     '<div class="grid2"><div><h2>Take one of these</h2>'+
       r.ok.map((x,i)=>'<div class="rec'+(i===0?' top':'')+'"'+
-        (live?' onclick="take(\''+x.i+'\')"':'')+'>'+
+        (live?' data-act="take" data-arg="'+esc(x.i)+'"':'')+'>'+
         '<span class="ps">'+x.p+'</span><span class="nm">'+esc(x.n)+'</span>'+
         '<span class="num">VOR '+x.v.toFixed(0)+'</span>'+
         '<span class="num">'+(x.cost>0?'costs '+x.cost.toFixed(0):'best')+'</span>'+
         '<span class="num">#'+x.r+'</span>'+
         '<span class="num">'+x.surv+'% back</span></div>').join('')+
       r.no.map(x=>'<div class="blocked">'+esc(x.n)+' ('+x.p+') &mdash; '+esc(x.note)+'</div>').join('')+
-      '<p style="margin-top:12px"><button onclick="autoPick()">Take the top one for me</button> '+
-      '<button onclick="reset()">Start over</button></p></div>'+
+      '<p style="margin-top:12px"><button data-act="auto">Take the top one for me</button> '+
+      '<button data-act="reset">Start over</button></p></div>'+
     '<div>'+rosterPanel()+'<h2>Recent picks</h2>'+
       S.picks.slice(-8).reverse().map(p=>'<div class="blocked">'+p.pick+'. '+
         esc(p.mgr)+' &mdash; '+esc(p.n)+' ('+p.p+')</div>').join('')+
@@ -441,22 +457,22 @@ function renderSetup(){
     ' projections. The other eleven seats are filled by models of how those '+
     'managers have actually drafted &mdash; not generic bots.</p>'+
     '<div class="card"><h3>1. Which manager are you?</h3><div class="row">'+
-      DATA.managers.map(m=>'<button data-m="'+esc(m)+'" onclick="setMe(this)"'+
+      DATA.managers.map(m=>'<button data-m="'+esc(m)+'" data-act="me"'+
         (m===pick_me?' class="sel"':'')+'>'+esc(m)+'</button>').join('')+
     '</div></div>'+
     '<div class="card"><h3>2. Which draft slot?</h3><div class="row">'+
-      Array.from({length:DATA.teams},(_,i)=>'<button onclick="setSlot('+(i+1)+')"'+
+      Array.from({length:DATA.teams},(_,i)=>'<button data-act="slot" data-arg="'+(i+1)+'"'+
         (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'</button>').join('')+
       '</div><p class="note">The real order is not out yet &mdash; pick any seat to practise.</p></div>'+
     '<div class="card"><h3>3. Strategy</h3><div class="row">'+
-      Object.entries(PRESETS).map(([k,v])=>'<button onclick="setPreset(\''+k+'\')"'+
+      Object.entries(PRESETS).map(([k,v])=>'<button data-act="preset" data-arg="'+k+'"'+
         (pick_preset===k?' class="sel"':'')+'>'+v.label+'</button>').join('')+
       '</div><p class="note">'+esc(PRESETS[pick_preset].note)+'</p></div>'+
-    '<p style="margin-top:18px"><button class="primary" onclick="start()"'+
+    '<p style="margin-top:18px"><button class="primary" data-act="start"'+
       ((pick_me&&pick_slot)?'':' disabled')+'>Start drafting</button></p>'+
     '<p class="note">Nothing is sent anywhere. The whole draft runs in your browser.</p>';
 }
-function setMe(b){ pick_me=b.dataset.m; renderSetup(); }
+function setMe(v){ pick_me=v; renderSetup(); }
 function setSlot(n){ pick_slot=n; renderSetup(); }
 function setPreset(k){ pick_preset=k; renderSetup(); }
 function reset(){ S=null; renderSetup(); }
@@ -470,7 +486,25 @@ function start(){
      rosters:{},done:false};
   runBots();
 }
+// One delegated listener for the whole app, re-bound to nothing on re-render
+// because it lives on the container rather than on the buttons themselves.
+document.getElementById("app").addEventListener("click", function(ev){
+  var el = ev.target && ev.target.closest ? ev.target.closest("[data-act]") : null;
+  if(!el) return;
+  var a = el.getAttribute("data-act"), v = el.getAttribute("data-arg");
+  try{
+    if(a==="me") setMe(el.getAttribute("data-m"));
+    else if(a==="slot") setSlot(parseInt(v,10));
+    else if(a==="preset") setPreset(v);
+    else if(a==="start") start();
+    else if(a==="take") take(v);
+    else if(a==="auto") autoPick();
+    else if(a==="reset") reset();
+  }catch(err){ fail(err); }
+});
 renderSetup();
+}catch(err){ fail(err); }
+})();
 </script>"""
 
 
