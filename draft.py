@@ -1,0 +1,913 @@
+﻿#!/usr/bin/env python3
+"""Draft advising -- mock simulation and live draft night.
+
+    python draft.py --mock              # simulate a full draft in the console
+    python draft.py --serve --mock      # same, in a browser, advancing live
+    python draft.py --serve             # draft night: follow the real draft
+
+The API is read-only, so this never makes a pick. It watches the board and
+tells you what it would do; you pick in the Sleeper app.
+"""
+
+import argparse
+import http.client
+import json
+import math
+import random
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+from model import RAW, Players, Season, _load, replacement_ranks
+from trade import REPLACEMENT_RANK, replacement_levels, season_projections
+
+ROOT = Path(__file__).resolve().parent
+API = "https://api.sleeper.app/v1"
+
+# Filled in from the league's own roster settings at startup. The advisor needs
+# kicker and defence on the board -- they are mandatory starters, and without
+# them the last two rounds produce no advice and the roster is never legal.
+DRAFT_REPLACEMENT = {**REPLACEMENT_RANK, "K": 12, "DEF": 12}
+SKILL = tuple(DRAFT_REPLACEMENT)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- directive
+# Edit this to change what the advisor is trying to do. Defaults encode the
+# plan the league analysis pointed to: RB is the scarcest thing here (103 VOR),
+# QB the most replaceable off waivers (24% hit rate), TE barely worth reaching
+# for (32 VOR), and a quarter of round 3 league-wide goes to QBs -- so waiting
+# means the RB/WR those three teams pass on falls to you.
+DIRECTIVE = {
+    "label": "Hero RB, late QB, let TE come to you",
+    "earliest_round": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
+    "max_by_round": {("RB", 5): 2},      # at most 2 RB through round 5
+    "want_by_round": {"RB": 2},          # one anchor RB by the end of round 2
+    "roster_caps": {"QB": 2, "K": 1, "DEF": 1, "TE": 2, "RB": 6, "WR": 7},
+}
+
+
+def get(path, timeout=15):
+    """One read-only GET. Returns parsed JSON, or None on any failure.
+
+    The except list is deliberately wide. urllib only converts errors raised by
+    h.request() into URLError -- getresponse() and read() sit outside that
+    conversion, so a dropped connection surfaces as a raw ConnectionResetError,
+    RemoteDisconnected or IncompleteRead. Over ~1800 requests on draft night a
+    narrow except would eventually let one escape and kill the polling thread.
+    """
+    req = urllib.request.Request(f"{API}/{path}",
+                                 headers={"User-Agent": "fantasy-analyzer/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+        return json.loads(body) if body else None
+    except (OSError, urllib.error.URLError, http.client.HTTPException,
+            TimeoutError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------- value board
+
+def build_board(season, players):
+    """Every projected player, ranked by value over replacement."""
+    proj = season_projections(season)
+    levels = replacement_levels(proj, players, DRAFT_REPLACEMENT)
+    board = []
+    for pid, pts in proj.items():
+        pos = players.position(pid)
+        if pos not in DRAFT_REPLACEMENT:
+            continue
+        board.append({
+            "player_id": pid, "name": players.name(pid), "pos": pos,
+            "proj": round(pts, 1), "vor": round(pts - levels[pos], 1),
+        })
+    board.sort(key=lambda p: -p["vor"])
+    for i, p in enumerate(board, 1):
+        p["rank"] = i
+    return board, levels
+
+
+# --------------------------------------------------------- opponent model
+
+def opponent_tendencies():
+    """P(position | round) for each manager, from their real drafts.
+
+    Falls back to the league average where a manager has thin history. This is
+    what a generic mock draft bot cannot do: these are the actual eleven people.
+    """
+    data = _load("../analysis.json") or json.loads(
+        (RAW.parent / "analysis.json").read_text(encoding="utf-8"))
+    per, league = defaultdict(lambda: defaultdict(lambda: defaultdict(int))), \
+        defaultdict(lambda: defaultdict(int))
+    for s in data["seasons"]:
+        for p in s["draft"]:
+            pos = p["position"]
+            if pos:
+                per[p["manager"]][p["round"]][pos] += 1
+                league[p["round"]][pos] += 1
+
+    def norm(counts):
+        total = sum(counts.values()) or 1
+        return {k: v / total for k, v in counts.items()}
+
+    league_norm = {r: norm(c) for r, c in league.items()}
+    out = {}
+    for mgr, rounds in per.items():
+        out[mgr] = {r: (norm(c) if sum(c.values()) >= 3 else league_norm.get(r, {}))
+                    for r, c in rounds.items()}
+    return out, league_norm
+
+
+# ------------------------------------------------------------ recommending
+
+def roster_counts(roster, board_by_id):
+    counts = defaultdict(int)
+    for pid in roster:
+        pos = board_by_id.get(pid, {}).get("pos")
+        if pos:
+            counts[pos] += 1
+    return counts
+
+
+def directive_check(pos, rnd, counts):
+    """Why the directive would or would not allow this pick.
+
+    Returns (allowed, note, kind). `kind` separates a timing rule you might
+    reasonably override ("no QB before round 8") from a roster fact you cannot
+    ("already have 2 TE") -- only the former is worth arguing with.
+    """
+    earliest = DIRECTIVE["earliest_round"].get(pos)
+    if earliest and rnd < earliest:
+        return False, f"directive: no {pos} before round {earliest}", "timing"
+    cap = DIRECTIVE["roster_caps"].get(pos)
+    if cap is not None and counts.get(pos, 0) >= cap:
+        return False, f"already have {counts[pos]} {pos}", "cap"
+    for (p, through), limit in DIRECTIVE["max_by_round"].items():
+        if p == pos and rnd <= through and counts.get(pos, 0) >= limit:
+            return False, f"directive: max {limit} {pos} through round {through}", "timing"
+    return True, "", ""
+
+
+def _poisson_below(k, lam):
+    """P(X < k) for X ~ Poisson(lam), computed iteratively to avoid factorials."""
+    if lam <= 0:
+        return 1.0
+    term, total = math.exp(-lam), 0.0
+    for i in range(max(0, k)):
+        if i:
+            term *= lam / i
+        total += term
+    return min(1.0, total)
+
+
+def survival(queue_rank, picks_until_next, league_norm, rnd, pos):
+    """Chance THIS player is still on the board at your next pick.
+
+    Not "will anyone take this position" -- that is near-certain and useless.
+    A player who is the k-th best available at his position only disappears if
+    at least k players at that position come off the board first. Treating
+    those departures as Poisson with rate = (this league's share of picks spent
+    on the position in this round) x (picks until you are back up) gives the
+    probability he survives. Uses the current round's rate throughout, so it is
+    approximate when your next pick lands in a later round.
+    """
+    rate = league_norm.get(rnd, {}).get(pos, 0.25)
+    lam = max(0, picks_until_next) * rate
+    return _poisson_below(queue_rank, lam)
+
+
+def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
+              limit=6):
+    """Rank the available players for this pick."""
+    by_id = {p["player_id"]: p for p in board}
+    counts = roster_counts(roster, by_id)
+    out = []
+    queue = defaultdict(int)   # how many better players remain at each position
+    for p in board:
+        if p["player_id"] in taken:
+            continue
+        queue[p["pos"]] += 1
+        ok, note, kind = directive_check(p["pos"], rnd, counts)
+        surv = survival(queue[p["pos"]], picks_until_next, league_norm, rnd, p["pos"])
+        # Value you would lose by waiting. Clamped at zero because the term is
+        # multiplicative in VOR: left unclamped, scarcity makes a NEGATIVE-value
+        # player score worse, so late in the draft it ranks the scarce player
+        # below the abundant one -- exactly backwards.
+        urgency = max(0.0, p["vor"]) * (1.0 - surv)
+        score = p["vor"] + urgency * 0.5 - (0 if ok else 10_000)
+        out.append({**p, "allowed": ok, "note": note, "block_kind": kind,
+                    "survives": round(surv * 100),
+                    "score": round(score, 1)})
+        if len(out) > 260:
+            break
+    out.sort(key=lambda p: -p["score"])
+    allowed = [p for p in out if p["allowed"]][:limit]
+    blocked = [p for p in out if not p["allowed"]][:2]
+    return allowed, blocked
+
+
+def directive_cost(allowed, blocked):
+    """The honest tension to surface: when the directive is blocking someone
+    clearly better than anything it permits, say so and let the user decide.
+
+    Deliberately NOT a warning about the tool's own top recommendation --
+    late in a draft the best player left is always worse than the pick number,
+    so a rank-versus-pick check fires constantly and means nothing. What stops
+    a reach is seeing the cost of each option, which every row carries.
+    """
+    # Only timing rules are worth arguing with. "Already have 2 TE" is a roster
+    # fact, not a decision -- flagging it as expensive would be noise.
+    timing = [b for b in blocked if b.get("block_kind") == "timing"]
+    if not allowed or not timing:
+        return ""
+    best_ok = max(allowed, key=lambda r: r["vor"])
+    best_blocked = max(timing, key=lambda r: r["vor"])
+    gap = best_blocked["vor"] - best_ok["vor"]
+    if gap >= 25:
+        return (f"Your directive is expensive here: {best_blocked['name']} "
+                f"({best_blocked['pos']}) is worth {gap:.0f} more points than "
+                f"{best_ok['name']} -- {best_blocked['note']}")
+    return ""
+
+
+# ---------------------------------------------------------------- draft state
+
+class DraftState:
+    """Board, picks made, and whose turn it is. Shared by mock and live."""
+
+    def __init__(self, season, league_id, draft_id, my_name, players, teams=12,
+                 rounds=15, slot=None):
+        self.season, self.league_id, self.draft_id = season, league_id, draft_id
+        self.players = players
+        self.teams, self.rounds = teams, rounds
+        self.my_name = my_name
+        self.board, self.levels = build_board(season, players)
+        self.by_id = {p["player_id"]: p for p in self.board}
+        self.tendencies, self.league_norm = opponent_tendencies()
+        self.order = []          # draft slot -> manager display name
+        self.slot = slot
+        self.picks = []          # [{pick_no, round, slot, manager, player_id}]
+        self.taken = set()
+        self.rosters = defaultdict(list)
+        self.order_known = False
+        self.users = {}
+        self.my_user_id = None
+        self.last_ok = time.time()
+        self.lock = threading.Lock()
+
+        # Manual rehearsal: the simulation stops on your pick and waits for you
+        # to choose, the way the real draft will.
+        self.manual = False
+        self.awaiting = False
+        self.pending = None
+        self.picked = threading.Event()
+
+    def grid(self):
+        """The draft board as Sleeper shows it: one column per slot, one row
+        per round, snaking left-to-right then right-to-left."""
+        by_pick = {p["pick_no"]: p for p in self.picks}
+        rows = []
+        for rnd in range(1, self.rounds + 1):
+            row = []
+            for slot in range(1, self.teams + 1):
+                offset = slot if rnd % 2 == 1 else (self.teams - slot + 1)
+                pk = (rnd - 1) * self.teams + offset
+                p = by_pick.get(pk)
+                row.append({"pick": pk, "mine": slot == self.slot,
+                            "name": p["name"] if p else "",
+                            "pos": p["pos"] if p else ""})
+            rows.append({"round": rnd, "cells": row})
+        return rows
+
+    def available(self, per_pos=12):
+        """Best remaining at each position, so you can take someone the
+        recommendation list did not surface."""
+        out = defaultdict(list)
+        for p in self.board:
+            if p["player_id"] in self.taken:
+                continue
+            if len(out[p["pos"]]) < per_pos:
+                out[p["pos"]].append(
+                    {k: p[k] for k in ("player_id", "name", "pos", "vor", "rank")})
+        return dict(out)
+
+    def apply_order(self, draft_order, users, my_user_id):
+        """Seat the draft from Sleeper's published order.
+
+        Never invent an order. Sleeper leaves draft_order null until shortly
+        before the draft, and a guessed seating silently misfiles every pick,
+        mistimes every turn alert, and computes picks-until-next -- which drives
+        the whole ranking -- for the wrong seat, for the entire night.
+        """
+        self.users, self.my_user_id = users, my_user_id
+        if not draft_order:
+            self.order = [n for n in users.values() if n][:self.teams]
+            self.order += [f"slot {i+1}" for i in range(len(self.order), self.teams)]
+            self.order_known = False
+            return False
+        seats = [None] * self.teams
+        for uid, slot in draft_order.items():
+            if isinstance(slot, int) and 1 <= slot <= self.teams:
+                seats[slot - 1] = users.get(uid) or f"slot {slot}"
+        self.order = [s or f"slot {i+1}" for i, s in enumerate(seats)]
+        mine = draft_order.get(my_user_id)
+        if isinstance(mine, int) and 1 <= mine <= self.teams:
+            self.slot = mine
+        self.order_known = True
+        return True
+
+    def force_slot(self, slot):
+        """Put yourself in a specific seat. Your slot and your seat in the
+        order have to be the same seat or picks land under a stranger."""
+        want = min(max(slot, 1), self.teams) - 1
+        if self.my_name in self.order:
+            here = self.order.index(self.my_name)
+            self.order[here], self.order[want] = self.order[want], self.order[here]
+        else:
+            self.order[want] = self.my_name
+        self.slot = want + 1
+
+    # -- geometry -------------------------------------------------------
+    def slot_on_clock(self, pick_no):
+        """Snake order: odd rounds left to right, even rounds reversed."""
+        rnd = (pick_no - 1) // self.teams + 1
+        idx = (pick_no - 1) % self.teams
+        return (idx + 1) if rnd % 2 == 1 else (self.teams - idx), rnd
+
+    def my_next_pick(self, after):
+        for pk in range(after, self.teams * self.rounds + 1):
+            s, _ = self.slot_on_clock(pk)
+            if s == self.slot:
+                return pk
+        return None
+
+    @property
+    def current_pick(self):
+        # Highest pick seen, not how many we hold: a gap or an out-of-order
+        # arrival would otherwise put the clock on the wrong selection.
+        return max((p["pick_no"] for p in self.picks), default=0) + 1
+
+    def record(self, pick_no, player_id, manager):
+        rnd = (pick_no - 1) // self.teams + 1
+        self.picks.append({"pick_no": pick_no, "round": rnd,
+                           "manager": manager, "player_id": player_id,
+                           "name": self.players.name(player_id),
+                           "pos": self.by_id.get(player_id, {}).get("pos", "?")})
+        self.taken.add(player_id)
+        self.rosters[manager].append(player_id)
+
+    # -- advice ---------------------------------------------------------
+    def advice(self):
+        pk = self.current_pick
+        if pk > self.teams * self.rounds:
+            return {"done": True}
+        slot, rnd = self.slot_on_clock(pk)
+        on_clock = self.order[slot - 1] if len(self.order) >= slot else f"slot {slot}"
+        nxt = self.my_next_pick(pk + 1)
+        gap = (nxt - pk) if nxt else 0
+        mine = self.rosters[self.my_name]
+        allowed, blocked = recommend(self.board, self.taken, mine, rnd, pk,
+                                     gap, self.league_norm)
+        counts = roster_counts(mine, self.by_id)
+        # What each option costs against the best thing on the board. This is
+        # the number that curbs reaching: take row 4 and you see the price.
+        # Priced against the highest VOR on offer, not against row one. Rows
+        # are ordered by score (which folds in scarcity), so row one is not
+        # always the most valuable player and a naive difference goes negative.
+        if allowed:
+            best = max(r["vor"] for r in allowed)
+            for r in allowed:
+                r["cost"] = round(max(0.0, best - r["vor"]), 1)
+        return {
+            "done": False, "pick_no": pk, "round": rnd, "slot": slot,
+            "on_clock": on_clock, "my_turn": slot == self.slot,
+            "picks_until_next": gap,
+            "recommend": allowed, "blocked": blocked,
+            "warn": directive_cost(allowed, blocked),
+            "roster": [self.by_id.get(p, {"name": self.players.name(p), "pos": "?",
+                                          "vor": 0}) for p in mine],
+            "counts": dict(counts),
+            "recent": list(reversed(self.picks[-8:])),
+            "directive": DIRECTIVE["label"],
+            "order_known": self.order_known,
+            "stale": round(time.time() - self.last_ok),
+            "manual": self.manual,
+            "awaiting": self.awaiting,
+            "grid": self.grid(),
+            "available": self.available(),
+            "teams": self.teams,
+            "order": self.order,
+            "my_slot": self.slot,
+        }
+
+
+# ------------------------------------------------------------------- mock
+
+def run_mock(state, rng, verbose=True):
+    """Simulate the whole draft. Opponents pick from their own tendencies."""
+    total = state.teams * state.rounds
+    while state.current_pick <= total:
+        pk = state.current_pick
+        slot, rnd = state.slot_on_clock(pk)
+        mgr = state.order[slot - 1]
+
+        if slot == state.slot:
+            adv = state.advice()
+            choice = adv["recommend"][0] if adv["recommend"] else None
+            if verbose and choice:
+                print(f"\n  --- YOUR PICK  (round {rnd}, pick {pk}) ---")
+                print(f"      next pick in {adv['picks_until_next']} selections")
+                for i, r in enumerate(adv["recommend"][:4], 1):
+                    print(f"      {i}. {r['name']:<24}{r['pos']:<4}"
+                          f"VOR {r['vor']:>6.0f}  costs {r['cost']:>5.0f}  "
+                          f"board #{r['rank']:<5}back {r['survives']}%")
+                for b in adv["blocked"]:
+                    print(f"      x  {b['name']:<24}{b['pos']:<4}{b['note']}")
+                if adv["warn"]:
+                    print(f"      !! {adv['warn']}")
+                print(f"      -> taking {choice['name']} ({choice['pos']})")
+            if not choice:
+                break
+            state.record(pk, choice["player_id"], mgr)
+            continue
+
+        pick = bot_pick(state, mgr, rnd, rng)
+        if pick is None:
+            break
+        state.record(pk, pick["player_id"], mgr)
+    return state
+
+
+# Nobody rosters nine receivers. Without these the simulated opponents draft
+# absurd shapes, which distorts what is left on the board for you.
+BOT_CAPS = {"QB": 2, "TE": 2, "RB": 6, "WR": 6, "K": 1, "DEF": 1}
+
+
+def bot_pick(state, mgr, rnd, rng):
+    """One opponent's selection: sample a position from that manager's own
+    draft history, respect roster sanity, then take the best available there."""
+    counts = roster_counts(state.rosters[mgr], state.by_id)
+    dist = state.tendencies.get(mgr, {}).get(rnd) or state.league_norm.get(rnd, {})
+    dist = {p: w for p, w in dist.items()
+            if p in SKILL and counts.get(p, 0) < BOT_CAPS.get(p, 99)}
+    pos = weighted_pick(dist, rng) if dist else None
+    free = (p for p in state.board if p["player_id"] not in state.taken)
+    if pos is None:
+        return next(free, None)
+    return next((p for p in state.board if p["player_id"] not in state.taken
+                 and p["pos"] == pos), next(free, None))
+
+
+def weighted_pick(dist, rng):
+    items = [(k, v) for k, v in dist.items() if k in SKILL and v > 0]
+    if not items:
+        return None
+    total = sum(v for _, v in items)
+    r = rng.random() * total
+    for k, v in items:
+        r -= v
+        if r <= 0:
+            return k
+    return items[-1][0]
+
+
+# ------------------------------------------------------------------- live
+
+def poll_live(state, interval=3.0):
+    """Follow the real draft. Read-only -- it never makes a pick.
+
+    Picks are tracked by their own pick_no rather than by list length, so one
+    arriving out of order or being removed cannot desynchronise the board. The
+    whole cycle is wrapped because this thread must not die: if it does, the
+    server keeps answering with a frozen board and the page shows confident,
+    stale advice with nothing to indicate anything is wrong.
+    """
+    seen = set()
+    while True:
+        try:
+            if not state.order_known:
+                d = get(f"draft/{state.draft_id}")
+                if d and d.get("draft_order"):
+                    with state.lock:
+                        state.apply_order(d["draft_order"], state.users,
+                                          state.my_user_id)
+                    print(f"  draft order published -- you are slot {state.slot}")
+
+            picks = get(f"draft/{state.draft_id}/picks")
+            if picks is None:
+                time.sleep(interval)
+                continue
+            state.last_ok = time.time()
+
+            fresh = [p for p in picks
+                     if p.get("pick_no") and p["pick_no"] not in seen
+                     and p.get("player_id")]
+            if fresh:
+                with state.lock:
+                    for p in sorted(fresh, key=lambda x: x["pick_no"]):
+                        pk = p["pick_no"]
+                        # Sleeper stamps each pick with its own slot and owner.
+                        # Trust those over anything derived from pick_no.
+                        slot = p.get("draft_slot") or state.slot_on_clock(pk)[0]
+                        mgr = (state.users.get(p.get("picked_by"))
+                               or (state.order[slot - 1]
+                                   if 1 <= slot <= len(state.order) else "?"))
+                        state.record(pk, str(p["player_id"]), mgr)
+                        seen.add(pk)
+                print(f"  {len(seen)} picks recorded")
+
+            if len(seen) >= state.teams * state.rounds:
+                print("  draft complete")
+                return
+        except Exception as err:                      # never let the thread die
+            print(f"  poll error ({type(err).__name__}: {err}); retrying")
+        time.sleep(interval)
+
+
+# ------------------------------------------------------------------ server
+
+# Interpolated with str.replace, never with %-formatting: this template holds
+# literal percent signs (CSS units, "% back" in the JS) and %-formatting reads
+# them as format specifiers and raises TypeError.
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Draft advisor</title><style>/*__CSS__*/
+/* Wider than the reports: those are set to a reading measure, this has to fit
+   a twelve-column draft board without a sideways scroll. */
+.wrap{max-width:1380px}
+.grid{display:grid;grid-template-columns:1fr 320px;gap:16px;align-items:start}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.rec{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;
+     border:1px solid var(--hairline);margin-bottom:6px;background:var(--surface)}
+.rec.top{border-color:var(--accent);border-width:2px}
+.rec .nm{font-weight:600;flex:1}
+.rec .pos{font-size:12px;color:var(--muted);width:32px}
+.rec .num{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:13px}
+.warn{background:var(--neg);color:#fff;padding:10px 14px;border-radius:8px;
+      font-weight:600;margin:10px 0}
+.turn{background:var(--accent);color:#fff;padding:14px 16px;border-radius:10px;
+      font-size:18px;font-weight:600;margin-bottom:12px}
+.wait{background:var(--surface);border:1px solid var(--hairline);padding:14px 16px;
+      border-radius:10px;margin-bottom:12px;color:var(--ink-2)}
+.blocked{opacity:.55;font-size:13px;padding:4px 12px}
+.chip{display:inline-block;background:var(--surface);border:1px solid var(--hairline);
+      border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;font-size:13px}
+
+/* Position hues: reference palette slots 1-6, fixed order, never cycled.
+   Every cell also carries the position as text, so colour is never the only
+   thing telling you what a player is. */
+:root{--cQB:#2a78d6;--cRB:#eb6834;--cWR:#1baf7a;--cTE:#eda100;--cK:#e87ba4;--cDEF:#008300}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}}
+:root[data-theme="dark"]{
+  --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
+
+.pick-on .rec{cursor:pointer}
+.pick-on .rec:hover{border-color:var(--accent);background:var(--page)}
+.rec .go{font-size:12px;color:var(--accent);font-weight:600;opacity:0}
+.pick-on .rec:hover .go{opacity:1}
+
+.board{overflow-x:auto;padding-bottom:6px}
+.board table{border-collapse:separate;border-spacing:3px;width:auto;font-size:11px}
+.board th{font-size:10px;font-weight:600;padding:1px 4px;border:none;
+          color:var(--muted);text-transform:none;letter-spacing:0;white-space:nowrap}
+.board th.me{color:var(--accent)}
+.board td{padding:0;border:none}
+.rd{color:var(--muted);font-variant-numeric:tabular-nums;padding-right:4px}
+.cell{width:104px;height:32px;border-radius:5px;background:var(--surface);
+      border:1px solid var(--hairline);border-left:3px solid var(--muted);
+      padding:3px 6px;overflow:hidden;line-height:1.2}
+.cell.empty{background:transparent;border-style:dashed;border-left-color:var(--hairline)}
+.cell.mine{box-shadow:inset 0 0 0 1px var(--accent)}
+.cell .n{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+         font-weight:600;color:var(--ink)}
+.cell .p{color:var(--muted);font-size:10px}
+.cQB{border-left-color:var(--cQB)}.cRB{border-left-color:var(--cRB)}
+.cWR{border-left-color:var(--cWR)}.cTE{border-left-color:var(--cTE)}
+.cK{border-left-color:var(--cK)}.cDEF{border-left-color:var(--cDEF)}
+
+.pool{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.pool h3{margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
+    border-left:3px solid var(--muted)}
+.pick-on .av{cursor:pointer}
+.pick-on .av:hover{background:var(--surface)}
+.av .v{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
+</style></head><body><div class="wrap">
+<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p>
+<div id="main"></div></div>
+<script>
+const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function pick(pid){
+  try{
+    const r = await fetch('/api/pick', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({player_id:String(pid)})});
+    if(r.ok) tick();
+  }catch(e){}
+}
+
+function board(s){
+  let head = '<tr><th></th>';
+  for(let i=0;i<s.teams;i++){
+    const nm = (s.order[i]||('slot '+(i+1)));
+    head += '<th class="'+(i+1===s.my_slot?'me':'')+'">'+esc(nm.slice(0,13))+'</th>';
+  }
+  head += '</tr>';
+  const rows = s.grid.map(r =>
+    '<tr><td class="rd">'+r.round+'</td>'+ r.cells.map(c =>
+      '<td><div class="cell '+(c.pos?'c'+c.pos:'empty')+(c.mine?' mine':'')+'">'+
+      (c.name ? '<span class="n">'+esc(c.name)+'</span><span class="p">'+esc(c.pos)+'</span>'
+              : '<span class="p">'+c.pick+'</span>')+
+      '</div></td>').join('') + '</tr>').join('');
+  return '<div class="board"><table>'+head+rows+'</table></div>';
+}
+
+function pool(s, live){
+  return '<div class="pool">'+['QB','RB','WR','TE','K','DEF'].map(p=>{
+    const list = (s.available[p]||[]).slice(0,8).map(a =>
+      '<div class="av c'+p+'"'+(live?' onclick="pick(\\''+a.player_id+'\\')"':'')+'>'+
+      '<span>'+esc(a.name)+'</span><span class="v">'+a.vor.toFixed(0)+'</span></div>').join('');
+    return list ? '<div><h3>'+p+'</h3>'+list+'</div>' : '';
+  }).join('')+'</div>';
+}
+
+async function tick(){
+  let s; try{ s = await (await fetch('/api/state')).json(); }catch(e){ return; }
+  const sub = document.getElementById('sub');
+  if(s.done){
+    sub.textContent = 'Draft complete';
+    document.getElementById('main').innerHTML = '<h2>Draft complete</h2>'+board(s);
+    return;
+  }
+  sub.textContent = 'Round '+s.round+' \\u00b7 pick '+s.pick_no+' \\u00b7 '+s.directive;
+  const live = !!(s.manual && s.awaiting && s.my_turn);
+  document.body.className = live ? 'pick-on' : '';
+
+  const rec = s.recommend.map((r,i)=>
+    '<div class="rec'+(i===0?' top':'')+'"'+(live?' onclick="pick(\\''+r.player_id+'\\')"':'')+'>'+
+    '<span class="pos">'+esc(r.pos)+'</span><span class="nm">'+esc(r.name)+'</span>'+
+    '<span class="num">VOR '+r.vor.toFixed(0)+'</span>'+
+    '<span class="num">'+(r.cost>0?'costs '+r.cost.toFixed(0):'best')+'</span>'+
+    '<span class="num">#'+r.rank+'</span>'+
+    '<span class="num">'+r.survives+'% back</span>'+
+    '<span class="go">take</span></div>').join('');
+  const blocked = s.blocked.map(b=>
+    '<div class="blocked">'+esc(b.name)+' ('+esc(b.pos)+') \\u2014 '+esc(b.note)+'</div>').join('');
+  const roster = s.roster.map(p=>
+    '<span class="chip">'+esc(p.pos)+' '+esc(p.name)+'</span>').join('');
+  const recent = s.recent.map(p=>
+    '<div class="blocked">'+p.pick_no+'. '+esc(p.manager)+' \\u2014 '+
+    esc(p.name)+' ('+esc(p.pos)+')</div>').join('');
+  const alerts =
+    (s.order_known===false
+      ? '<div class="warn">Sleeper has not published the draft order yet \\u2014 '+
+        'whose turn it is and how long until yours are not reliable until it does.</div>' : '')+
+    (s.stale>15
+      ? '<div class="warn">No update from Sleeper for '+s.stale+'s \\u2014 this board '+
+        'may be stale. Check the Sleeper app.</div>' : '');
+
+  document.getElementById('main').innerHTML = alerts+
+    (live ? '<div class="turn">YOUR PICK \\u2014 round '+s.round+', pick '+s.pick_no+
+            '. Click a player to draft him.</div>'
+     : s.my_turn ? '<div class="turn">YOU ARE ON THE CLOCK \\u2014 pick '+s.pick_no+'</div>'
+                 : '<div class="wait">'+esc(s.on_clock)+' is picking. You are up in '+
+                   s.picks_until_next+'.</div>')+
+    (s.warn ? '<div class="warn">'+esc(s.warn)+'</div>' : '')+
+    '<div class="grid"><div><h2>Take one of these</h2>'+rec+blocked+'</div>'+
+    '<div><h2>Your roster</h2><div>'+(roster||'<span class="sub">empty</span>')+
+    '</div><h2>Recent picks</h2>'+recent+'</div></div>'+
+    '<h2>Best available</h2>'+pool(s, live)+
+    '<h2>Draft board</h2>'+board(s);
+}
+tick(); setInterval(tick, 1500);
+</script></body></html>"""
+
+
+def serve(state, host, port, open_browser=True):
+    from report import CSS
+    page = PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/api/state"):
+                with state.lock:
+                    body = json.dumps(state.advice()).encode("utf-8")
+                self._send(200, body, "application/json")
+            else:
+                self._send(200, page, "text/html; charset=utf-8")
+
+        def do_POST(self):
+            """Your pick, in rehearsal mode. Rejected unless the simulation is
+            actually waiting on you and the player is genuinely available."""
+            if not self.path.startswith("/api/pick"):
+                self._send(404, b'{"ok":false}', "application/json")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                pid = str(json.loads(self.rfile.read(n) or b"{}").get("player_id") or "")
+            except (ValueError, json.JSONDecodeError):
+                pid = ""
+            with state.lock:
+                ok = bool(state.awaiting and pid in state.by_id
+                          and pid not in state.taken)
+                if ok:
+                    state.pending = pid
+            if ok:
+                state.picked.set()
+            self._send(200 if ok else 409,
+                       json.dumps({"ok": ok}).encode("utf-8"), "application/json")
+
+    srv = HTTPServer((host, port), Handler)
+    url = f"http://localhost:{port}"
+    print(f"  advisor running at {url}")
+    if host == "0.0.0.0":
+        print(f"  on your phone (same wifi): http://<this-machine-ip>:{port}")
+        print("  reachable by anything on your network -- stop it after the draft")
+    if open_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopped")
+
+
+# -------------------------------------------------------------------- main
+
+def setup(args):
+    index = _load("index.json")
+    if not index:
+        raise SystemExit("No data. Run: python pull.py")
+    me = index["username"]
+    season = args.season or max(s["season"] for s in index["seasons"])
+    league_id = next(s["league_id"] for s in index["seasons"] if s["season"] == season)
+
+    global DRAFT_REPLACEMENT, SKILL
+    players = Players()
+    league = get(f"league/{league_id}") or {}
+    teams = league.get("total_rosters", 12)
+
+    # Board depth comes from this league's roster settings, not an assumed
+    # format. A 10-team or superflex league needs different numbers entirely.
+    cached = Season(season, league_id)
+    derived = replacement_ranks(cached)
+    if derived:
+        DRAFT_REPLACEMENT = derived
+        SKILL = tuple(derived)
+
+    drafts = get(f"league/{league_id}/drafts") or []
+    if not drafts:
+        raise SystemExit(f"No draft found for {season}.")
+    d = drafts[0]
+    rounds = (d.get("settings") or {}).get("rounds", 15)
+
+    state = DraftState(season, league_id, d["draft_id"], me, players,
+                       teams=teams, rounds=rounds)
+
+    users = {u["user_id"]: u.get("display_name") for u in
+             (get(f"league/{league_id}/users") or [])}
+    if not users:
+        raise SystemExit(
+            "Could not read the league's members from Sleeper. Check your\n"
+            "connection and run it again -- continuing without them would file\n"
+            "every pick under the wrong manager.")
+
+    published = state.apply_order(d.get("draft_order"), users, index["user_id"])
+    if args.slot:
+        state.force_slot(args.slot)
+    elif not published:
+        state.slot = state.order.index(me) + 1 if me in state.order else 1
+
+    if not published:
+        print("  ! Sleeper has not published the draft order yet.")
+        if args.mock:
+            print("    Mock will seat you at slot "
+                  f"{state.slot} -- pass --slot N to try another.")
+        else:
+            print("    Watching for it; advice is not seat-specific until it lands.")
+    print(f"  {season} draft {d['draft_id']} | {teams} teams x {rounds} rounds")
+    print(f"  you are {me}, slot {state.slot} | directive: {DIRECTIVE['label']}")
+    return state
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mock", action="store_true", help="simulate instead of following the real draft")
+    ap.add_argument("--serve", action="store_true", help="run the browser UI")
+    ap.add_argument("--slot", type=int, help="your draft slot (1-12)")
+    ap.add_argument("--season", help="defaults to the newest season")
+    ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to reach it from your phone")
+    ap.add_argument("--port", type=int, default=8770)
+    ap.add_argument("--seed", type=int, default=None, help="repeat a mock draft exactly")
+    ap.add_argument("--no-open", action="store_true", help="do not launch a browser")
+    ap.add_argument("--delay", type=float, default=3.0,
+                    help="seconds per simulated pick (default 3)")
+    ap.add_argument("--manual", action="store_true",
+                    help="rehearsal: the mock stops on your pick and waits for you")
+    args = ap.parse_args()
+
+    state = setup(args)
+    state.manual = bool(args.manual and args.mock and args.serve)
+    if args.manual and not (args.mock and args.serve):
+        print("  ! --manual needs --serve --mock; ignoring it")
+    if state.manual:
+        print("  rehearsal mode: the simulation will wait for you on your picks")
+    rng = random.Random(args.seed)
+
+    if args.serve:
+        if args.mock:
+            threading.Thread(target=lambda: mock_loop(state, rng, args.delay),
+                             daemon=True).start()
+        else:
+            threading.Thread(target=lambda: poll_live(state), daemon=True).start()
+        serve(state, args.host, args.port, open_browser=not args.no_open)
+    elif args.mock:
+        run_mock(state, rng)
+        summarize(state)
+    else:
+        print("  following the live draft (ctrl-c to stop)")
+        poll_live(state)
+
+
+def mock_loop(state, rng, delay):
+    """Advance a simulated draft one pick at a time so the UI can be watched."""
+    total = state.teams * state.rounds
+    while state.current_pick <= total:
+        pk = state.current_pick
+        slot, rnd = state.slot_on_clock(pk)
+        mgr = state.order[slot - 1]
+        if slot == state.slot:
+            if state.manual:
+                # Hand the pick to the user and wait. The lock is deliberately
+                # not held here -- the server needs it to answer /api/state
+                # while we wait, or the page would freeze on your own turn.
+                with state.lock:
+                    state.awaiting = True
+                state.picked.clear()
+                while not state.picked.wait(timeout=0.25):
+                    pass
+                with state.lock:
+                    choice = state.by_id.get(state.pending)
+                    state.pending, state.awaiting = None, False
+                if choice is None:
+                    continue
+            else:
+                time.sleep(delay * 2)   # linger so the recommendation is readable
+                adv = state.advice()
+                if not adv.get("recommend"):
+                    return
+                choice = adv["recommend"][0]
+        else:
+            time.sleep(delay)
+            choice = bot_pick(state, mgr, rnd, rng)
+            if choice is None:
+                return
+        with state.lock:
+            state.record(pk, choice["player_id"], mgr)
+            state.last_ok = time.time()   # a mock pick is fresh information too
+
+
+def summarize(state):
+    mine = state.rosters[state.my_name]
+    print("\n" + "=" * 62)
+    print(f"  YOUR TEAM  ({DIRECTIVE['label']})")
+    print("=" * 62)
+    counts = defaultdict(int)
+    total = 0.0
+    for i, pid in enumerate(mine, 1):
+        p = state.by_id.get(pid, {})
+        counts[p.get("pos", "?")] += 1
+        total += p.get("proj", 0)
+        print(f"    R{i:<3}{p.get('name','?')[:26]:<28}{p.get('pos','?'):<5}"
+              f"proj {p.get('proj',0):>6.1f}   VOR {p.get('vor',0):>+6.0f}")
+    print(f"\n    shape: " + "  ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    print(f"    projected total: {total:.0f}")
+    first_qb = next((i for i, pid in enumerate(mine, 1)
+                     if state.by_id.get(pid, {}).get("pos") == "QB"), None)
+    print(f"    first QB: round {first_qb}" if first_qb else "    no QB drafted")
+
+
+if __name__ == "__main__":
+    main()
+

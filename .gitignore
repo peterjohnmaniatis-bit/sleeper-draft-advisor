@@ -1,0 +1,14 @@
+# Your league's raw data stays on your machine. It contains other league
+# members' names and activity, and they did not agree to be published.
+data/
+
+# Generated reports
+report.html
+draft-report.html
+out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
