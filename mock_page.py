@@ -121,7 +121,12 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .blocked{opacity:.55;font-size:13px;padding:3px 12px}
 .chip{display:inline-block;background:var(--surface);border:1px solid var(--hairline);
  border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;font-size:13px}
-.pool{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px}
+.pool{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:10px}
+.pool .col{max-height:340px;overflow-y:auto}
+#q{font:inherit;width:100%;max-width:420px;padding:9px 12px;border-radius:8px;
+ border:1px solid var(--hairline);background:var(--surface);color:var(--ink)}
+#q:focus{outline:2px solid var(--accent);outline-offset:1px}
+.hits{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:6px}
 .av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
  border-left:3px solid var(--muted)}
 .live .av{cursor:pointer}
@@ -196,7 +201,9 @@ const POS = ["QB","RB","WR","TE","K","DEF"];
 const BOT_CAPS = {QB:2,TE:2,RB:6,WR:6,K:1,DEF:1};
 
 let S = null;
-const esc = t => String(t).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let query = "";
+const esc = t => String(t).replace(/[&<>"]/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 function slotOnClock(pk){
   const r = Math.floor((pk-1)/DATA.teams)+1, i=(pk-1)%DATA.teams;
@@ -310,14 +317,27 @@ function boardHTML(){
   }
   return h+'</table></div>';
 }
+function row(a, live){
+  return '<div class="av c'+a.p+'"'+(live?' data-act="take" data-arg="'+esc(a.i)+'"':'')+'>'+
+    '<span>'+esc(a.n)+'</span><span class="v">'+a.p+' &middot; '+a.v.toFixed(0)+'</span></div>';
+}
+// Every undrafted player is reachable: search by name, or scroll a position
+// column. Capping the columns at eight was the whole board for most people.
 function poolHTML(live){
-  const seen={};
+  const q = query.trim().toLowerCase();
+  if(q){
+    const hits = DATA.board.filter(p=>!S.taken.has(p.i) && p.n.toLowerCase().indexOf(q)>=0);
+    if(!hits.length)
+      return '<p class="note">Nobody available matches "'+esc(query)+'".</p>';
+    return '<p class="note">'+hits.length+' available'+
+      (hits.length>60?' (showing 60)':'')+(live?' &mdash; click to draft':'')+'</p>'+
+      '<div class="hits">'+hits.slice(0,60).map(a=>row(a,live)).join('')+'</div>';
+  }
   return '<div class="pool">'+POS.map(pos=>{
-    const list=DATA.board.filter(p=>p.p===pos && !S.taken.has(p.i)).slice(0,8);
+    const list=DATA.board.filter(p=>p.p===pos && !S.taken.has(p.i));
     if(!list.length) return '';
-    return '<div><h3>'+pos+'</h3>'+list.map(a=>
-      '<div class="av c'+pos+'"'+(live?' data-act="take" data-arg="'+esc(a.i)+'"':'')+'>'+
-      '<span>'+esc(a.n)+'</span><span class="v">'+a.v.toFixed(0)+'</span></div>').join('')+'</div>';
+    return '<div><h3>'+pos+' <span class="note">('+list.length+' left)</span></h3>'+
+      '<div class="col">'+list.slice(0,40).map(a=>row(a,live)).join('')+'</div></div>';
   }).join('')+'</div>';
 }
 function fillSlots(roster){
@@ -359,7 +379,9 @@ function rosterPanel(){
       '<td class="num">'+p.j.toFixed(0)+'</td></tr>').join('')+'</table>' : '');
 }
 function legend(){
-  return '<details class="key"><summary>What the numbers mean</summary>'+
+  // Open by default. Collapsed, it reads as though the page never explained
+  // its own numbers.
+  return '<details class="key" open><summary>What the numbers mean</summary>'+
     '<table class="sum" style="margin-top:10px">'+
     '<tr><td><b>VOR</b></td><td>Value over replacement: how many more points this '+
       'player is projected to score than a player at his position you could pick up '+
@@ -444,7 +466,13 @@ function render(){
         esc(p.mgr)+' &mdash; '+esc(p.n)+' ('+p.p+')</div>').join('')+
     '</div></div>'+
     legend()+
-    '<h2>Best available</h2>'+poolHTML(live)+
+    '<h2>Every available player</h2>'+
+    '<p class="note" style="margin:0 0 8px">Search by name or scroll a position '+
+      'column. Anything here can be drafted &mdash; you are never limited to the '+
+      'six recommendations above.</p>'+
+    '<input id="q" type="search" autocomplete="off" '+
+      'placeholder="Type a player name..." value="'+esc(query)+'">'+
+    '<div id="pool" style="margin-top:10px">'+poolHTML(live)+'</div>'+
     '<h2>Draft board</h2>'+boardHTML();
 }
 
@@ -501,6 +529,16 @@ document.getElementById("app").addEventListener("click", function(ev){
     else if(a==="auto") autoPick();
     else if(a==="reset") reset();
   }catch(err){ fail(err); }
+});
+// Typing repaints only the results list, so the box keeps its value and focus.
+// Re-rendering the whole page on every keystroke would drop the cursor.
+document.getElementById("app").addEventListener("input", function(ev){
+  if(!ev.target || ev.target.id !== "q" || !S) return;
+  query = ev.target.value;
+  var pool = document.getElementById("pool");
+  if(!pool) return;
+  var pk = S.picks.length ? Math.max.apply(null, S.picks.map(function(x){return x.pick;}))+1 : 1;
+  try{ pool.innerHTML = poolHTML(slotOnClock(pk)[0] === S.slot); }catch(err){ fail(err); }
 });
 renderSetup();
 }catch(err){ fail(err); }
