@@ -104,8 +104,13 @@ rules that match what it tells you.
 
 ## Examples
 
-`examples/` holds real output from five seasons of one league, with every
-manager anonymised. Open the HTML files in a browser.
+`examples/` holds real output from five seasons of one league. Open the HTML
+files in a browser.
+
+`python mock_page.py` builds a self-contained mock-draft page you can share as a
+file or host anywhere — the player board and each manager's tendencies are baked
+in at build time, so it needs no install and makes no network requests. Whoever
+opens it picks which manager they are and drafts from that seat.
 
 The findings from that league, as a flavour of what the analysis surfaces:
 
