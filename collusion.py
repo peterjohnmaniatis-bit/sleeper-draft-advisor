@@ -128,6 +128,70 @@ def matchup_effort(seasons, players):
     return overall, versus
 
 
+# ------------------------------------------ 4. value passed to one partner
+
+def draft_value_flow(seasons, players, data):
+    """Whose picks does one manager's passed value keep landing on?
+
+    Everybody passes value on every pick -- nobody drafts perfectly, and this
+    is judged in hindsight. So "he passed on a good player" means nothing. The
+    signal is CONCENTRATION: with eleven opponents, a manager's passed value
+    should scatter at roughly 9% each. One partner collecting 25-30% is the
+    shape a funnelling arrangement makes.
+
+    Slot distance is reported alongside because it is the innocent explanation
+    for most of it: in a snake, whoever picks right after you collects the most
+    of what you skipped, by pure geometry rather than by arrangement.
+    """
+    flow, totals, dist = defaultdict(float), defaultdict(float), defaultdict(list)
+    for s in data["seasons"]:
+        picks = sorted(s["draft"], key=lambda p: p["pick_no"] or 0)
+        if not picks:
+            continue
+        teams = len({p["roster_id"] for p in picks}) or 12
+        slot_of = {}
+        for p in picks:
+            rnd = (p["pick_no"] - 1) // teams + 1
+            idx = (p["pick_no"] - 1) % teams
+            slot_of[p["pick_no"]] = (idx + 1) if rnd % 2 == 1 else (teams - idx)
+
+        for i, mine in enumerate(picks):
+            for later in picks[i + 1:]:
+                # Still on the board when `mine` picked, and finished better.
+                if later["value_rank"] >= mine["value_rank"]:
+                    continue
+                worth = mine["value_rank"] - later["value_rank"]
+                key = (mine["manager"], later["manager"])
+                flow[key] += worth
+                totals[mine["manager"]] += worth
+                gap = abs(slot_of[later["pick_no"]] - slot_of[mine["pick_no"]])
+                dist[key].append(min(gap, teams - gap))
+
+    rows = []
+    for (a, b), v in flow.items():
+        if a == b or totals[a] <= 0:
+            continue
+        share = v / totals[a] * 100
+        rows.append((share, a, b, sum(dist[(a, b)]) / len(dist[(a, b)])))
+    return sorted(rows, reverse=True)
+
+
+def traded_picks(seasons):
+    """Draft picks changing hands. Concentrating early picks on one roster is
+    the bluntest way to rig a draft, and Sleeper records every one."""
+    out = []
+    for s in seasons:
+        from model import _load
+        for tp in (_load(f"{s.season}/traded_picks.json") or []):
+            out.append({
+                "season": s.season, "round": tp.get("round"),
+                "from": s.display(tp.get("previous_owner_id")),
+                "to": s.display(tp.get("owner_id")),
+                "original": s.display(tp.get("roster_id")),
+            })
+    return out
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -203,6 +267,44 @@ def main():
     print(f"\n   Sample sizes here are {MIN_MEETINGS}-8 games. A gap under about")
     print("   10 points is noise. Even a large one usually means someone was on")
     print("   holiday that week, not that they threw a match.")
+
+    # 4 -------------------------------------------------------------------
+    import json
+    from model import RAW
+    data = json.loads((RAW.parent / "analysis.json").read_text(encoding="utf-8"))
+    if args.season:
+        data["seasons"] = [x for x in data["seasons"] if x["season"] == args.season]
+
+    rows = draft_value_flow(seasons, players, data)
+    n_opp = max(1, len({m.get("display_name") for x in data["seasons"]
+                        for m in x["managers"].values()}) - 1)
+    expected = 100.0 / n_opp
+    print("\n\n4. DRAFT VALUE LANDING WITH ONE PARTNER")
+    print(f"   Share of each manager's passed-over value collected by each")
+    print(f"   opponent. With {n_opp} opponents, chance alone gives about "
+          f"{expected:.0f}%.\n")
+    print(f"   {'passed by':<18}{'collected by':<18}{'share':>8}{'vs chance':>11}"
+          f"{'slot gap':>10}")
+    for share, a, b, gap in rows[:10]:
+        print(f"   {a[:16]:<18}{b[:16]:<18}{share:>7.1f}%{share - expected:>+11.1f}"
+              f"{gap:>10.1f}")
+    print("\n   Slot gap is the innocent explanation: whoever drafts right after")
+    print("   you collects most of what you skipped, by snake geometry. A high")
+    print("   share at gap 1-2 is arithmetic. A high share at gap 5+ is odd.")
+
+    # 5 -------------------------------------------------------------------
+    tp = traded_picks(seasons)
+    print(f"\n\n5. TRADED DRAFT PICKS   ({len(tp)} found)")
+    if not tp:
+        print("   None. Nobody in this league has ever traded a draft pick,")
+        print("   which removes the bluntest way to rig a draft entirely.")
+    else:
+        print(f"   {'season':<8}{'round':<7}{'from':<18}{'to':<18}")
+        for t in tp[:15]:
+            print(f"   {t['season']:<8}{str(t['round']):<7}{t['from'][:16]:<18}"
+                  f"{t['to'][:16]:<18}")
+        print("\n   Watch for early-round picks concentrating on one roster,")
+        print("   especially from managers who then finish badly.")
 
     print("\n" + "=" * 76)
     print("  Before acting on any of this: look at the actual trade or lineup,")
