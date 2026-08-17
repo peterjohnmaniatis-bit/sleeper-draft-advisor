@@ -67,6 +67,38 @@ def collect():
     }
 
 
+# Manager -> skin. Drop an image at assets/skin-<manager>.<png|jpg|gif|webp>
+# and it is inlined here automatically. Nothing is fetched over the network,
+# at build time or at view time.
+SKIN_CONFIG = {
+    "wburnett7": {"cls": "skin-wburnett7", "title": "Jalen Hurts RB2"},
+}
+MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def skins():
+    """Build the skin table, inlining any image found in assets/."""
+    import base64
+    out = {}
+    assets = ROOT / "assets"
+    for name, cfg in SKIN_CONFIG.items():
+        art = ""
+        for ext, mime in MIME.items():
+            f = assets / f"skin-{name}{ext}"
+            if f.exists():
+                blob = base64.b64encode(f.read_bytes()).decode("ascii")
+                art = f"data:{mime};base64,{blob}"
+                print(f"  skin {name}: embedded {f.name} "
+                      f"({f.stat().st_size/1024:.0f} KB)")
+                break
+        else:
+            print(f"  skin {name}: no image at assets/skin-{name}.png "
+                  f"-- header only")
+        out[name] = {**cfg, "art": art}
+    return out
+
+
 PAGE = r"""<title>Mock draft room</title>
 <style>
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;
@@ -148,10 +180,13 @@ body.skin-wburnett7 h1{color:#00915c;letter-spacing:-.01em}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]) body.skin-wburnett7{
   --accent:#12b877;--cWR:#12b877}}
 :root[data-theme="dark"] body.skin-wburnett7{--accent:#12b877;--cWR:#12b877}
-.hero{display:flex;align-items:center;gap:14px;margin:0 0 4px}
-.hero svg{flex:0 0 auto}
+.hero{display:flex;align-items:center;gap:16px;margin:0 0 6px}
+.hero img{flex:0 0 auto;max-width:230px;max-height:230px;border-radius:10px;
+ border:1px solid var(--hairline);display:block}
 .hero .ht{min-width:0}
 .hero h1{margin:0}
+@media(max-width:620px){.hero{flex-direction:column;align-items:flex-start}
+ .hero img{max-width:100%}}
 .av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
  border-left:3px solid var(--muted)}
 .live .av{cursor:pointer}
@@ -224,24 +259,9 @@ const PRESETS = {
 };
 const POS = ["QB","RB","WR","TE","K","DEF"];
 
-// Original artwork, drawn inline so it survives a strict content policy and
-// needs no network. Not a likeness of anything.
-const JALAPENO = '<svg width="58" height="58" viewBox="0 0 64 64" role="img" '+
-  'aria-label="cartoon jalapeno"><path d="M38 12c6-3 13-2 16 3 1 2-2 3-4 2-3-2-7-2-10 0z" '+
-  'fill="#2f7d32"/><path d="M40 16c8 6 10 18 5 27-5 10-16 15-24 12-7-3-9-11-6-19 '+
-  '4-10 14-19 25-20z" fill="#1faa4b"/><path d="M43 21c5 6 6 16 2 23-4 8-12 13-19 12 '+
-  '7-1 13-6 16-13 4-8 4-16 1-22z" fill="#15803d"/><ellipse cx="30" cy="33" rx="4" '+
-  'ry="5" fill="#fff"/><ellipse cx="41" cy="31" rx="4" ry="5" fill="#fff"/>'+
-  '<circle cx="30.5" cy="34" r="2.1" fill="#111"/><circle cx="41.5" cy="32" r="2.1" '+
-  'fill="#111"/><path d="M28 44c4 3 9 3 13-1" stroke="#0b4d20" stroke-width="2.4" '+
-  'fill="none" stroke-linecap="round"/><path d="M36 8c1-3 4-5 7-4-2 1-3 3-3 5z" '+
-  'fill="#2f7d32"/></svg>';
-
-// Optional per-manager skin: body class, page title, and a mascot.
-const SKINS = {
-  wburnett7: { cls: "skin-wburnett7", title: "Jalen Hurts RB2", art: JALAPENO,
-               sub: "Kelly green, and a pepper with opinions." }
-};
+// Per-manager skins, assembled at build time. Any image is inlined as a data
+// URI, because a published page cannot load one over the network.
+const SKINS = __SKINS__;
 const BOT_CAPS = {QB:2,TE:2,RB:6,WR:6,K:1,DEF:1};
 
 let S = null;
@@ -492,8 +512,10 @@ function render(){
   const meta = esc(S.me)+' &middot; slot '+S.slot+' &middot; round '+r.rnd+
     ', pick '+r.pk+' &middot; '+PRESETS[S.preset].label;
   app.innerHTML=
-    (sk ? '<div class="hero">'+sk.art+'<div class="ht"><h1>'+esc(sk.title)+'</h1>'+
-          '<p class="sub">'+meta+'</p></div></div>'
+    (sk ? '<div class="hero">'+
+            (sk.art ? '<img src="'+sk.art+'" alt="">' : '')+
+            '<div class="ht"><h1>'+esc(sk.title)+'</h1>'+
+            '<p class="sub">'+meta+'</p></div></div>'
         : '<h1>Mock draft room</h1><p class="sub">'+meta+'</p>')+
     (warn?'<div class="warn">'+esc(warn)+'</div>':'')+
     (live?'<div class="turn">YOUR PICK &mdash; click a player to draft him</div>'
@@ -634,6 +656,7 @@ def main():
     # valid JavaScript. HTML entities would NOT work here -- they are not parsed
     # inside a <script> block.
     doc = PAGE.replace("__DATA__", blob)
+    doc = doc.replace("__SKINS__", json.dumps(skins(), ensure_ascii=True))
     if any(ord(c) > 127 for c in doc):
         raise SystemExit("non-ASCII leaked into the page")
     OUT.parent.mkdir(exist_ok=True)
