@@ -508,13 +508,6 @@ function renderSetup(){
       ((pick_me&&pick_slot)?'':' disabled')+'>'+
       (pick_me?'Start drafting from slot '+pick_slot:'Pick your manager to start')+
       '</button></p>'+
-    '<details class="key"><summary>Rehearse from a different seat</summary>'+
-      '<div class="row" style="margin-top:8px">'+
-      Array.from({length:DATA.teams},(_,i)=>'<button data-act="slot" data-arg="'+(i+1)+'"'+
-        (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'. '+
-        esc(DATA.managers[i])+'</button>').join('')+
-      '</div><p class="note">Only for practice. On the night you will be in the '+
-      'seat shown above.</p></details>'+
     '<p class="note" style="margin-top:14px">Nothing is sent anywhere. '+
       'The whole draft runs in your browser.</p>';
 }
