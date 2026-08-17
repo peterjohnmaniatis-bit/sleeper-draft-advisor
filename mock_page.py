@@ -488,10 +488,12 @@ function renderSetup(){
       DATA.managers.map(m=>'<button data-m="'+esc(m)+'" data-act="me"'+
         (m===pick_me?' class="sel"':'')+'>'+esc(m)+'</button>').join('')+
     '</div></div>'+
-    '<div class="card"><h3>2. Which draft slot?</h3><div class="row">'+
+    '<div class="card"><h3>2. Draft slot</h3><div class="row">'+
       Array.from({length:DATA.teams},(_,i)=>'<button data-act="slot" data-arg="'+(i+1)+'"'+
-        (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'</button>').join('')+
-      '</div><p class="note">The real order is not out yet &mdash; pick any seat to practise.</p></div>'+
+        (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'. '+
+        esc(DATA.managers[i])+'</button>').join('')+
+      '</div><p class="note">This is the real draft order. Choosing your name '+
+      'seats you correctly; pick another slot to rehearse from somewhere else.</p></div>'+
     '<div class="card"><h3>3. Strategy</h3><div class="row">'+
       Object.entries(PRESETS).map(([k,v])=>'<button data-act="preset" data-arg="'+k+'"'+
         (pick_preset===k?' class="sel"':'')+'>'+v.label+'</button>').join('')+
@@ -500,7 +502,14 @@ function renderSetup(){
       ((pick_me&&pick_slot)?'':' disabled')+'>Start drafting</button></p>'+
     '<p class="note">Nothing is sent anywhere. The whole draft runs in your browser.</p>';
 }
-function setMe(v){ pick_me=v; renderSetup(); }
+// Picking your name seats you where Sleeper actually put you. You can still
+// override it to rehearse a different seat.
+function setMe(v){
+  pick_me=v;
+  const i=DATA.managers.indexOf(v);
+  if(i>=0) pick_slot=i+1;
+  renderSetup();
+}
 function setSlot(n){ pick_slot=n; renderSetup(); }
 function setPreset(k){ pick_preset=k; renderSetup(); }
 function reset(){ S=null; renderSetup(); }
