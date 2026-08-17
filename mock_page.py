@@ -110,14 +110,23 @@ button:disabled{opacity:.45;cursor:not-allowed}
  font-weight:600;margin-bottom:10px}
 .grid2{display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start}
 @media(max-width:860px){.grid2{grid-template-columns:1fr}}
-.rec{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;
- border:1px solid var(--hairline);margin-bottom:6px;background:var(--surface)}
-.rec.top{border-color:var(--accent);border-width:2px}
+/* Six recommendations as a 3 x 2 grid of cards. A single flex row per player
+   had no room for four metrics without them collapsing into a strip of
+   unlabelled digits. */
+.recs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
+@media(max-width:1040px){.recs{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.recs{grid-template-columns:1fr}}
+.rec{display:block;padding:11px 13px;border-radius:9px;background:var(--surface);
+ border:1px solid var(--hairline);border-left:3px solid var(--muted)}
+.rec.top{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 .live .rec{cursor:pointer}
 .live .rec:hover{background:var(--page);border-color:var(--accent)}
-.rec .nm{font-weight:600;flex:1}
-.rec .ps{font-size:12px;color:var(--muted);width:32px}
-.rec .num{font-size:13px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.rec .ps{font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--muted)}
+.rec .nm{display:block;font-weight:600;font-size:15px;line-height:1.25;
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.rec .mets{display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;margin-top:9px;
+ font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.rec .mets b{color:var(--ink);font-weight:600}
 .blocked{opacity:.55;font-size:13px;padding:3px 12px}
 .chip{display:inline-block;background:var(--surface);border:1px solid var(--hairline);
  border-radius:999px;padding:2px 10px;margin:2px 4px 2px 0;font-size:13px}
@@ -130,6 +139,19 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .seat{margin:12px 0 0;padding:9px 14px;border-radius:8px;font-size:14px;
  background:var(--page);border:1px solid var(--accent);color:var(--ink)}
 .seat b{color:var(--accent)}
+
+/* Per-manager skin. Applied by adding a class to <body>, so it only has to
+   override the accent token and a couple of surfaces. */
+body.skin-wburnett7{--accent:#00915c;--cWR:#00915c}
+body.skin-wburnett7 .turn{background:#00915c}
+body.skin-wburnett7 h1{color:#00915c;letter-spacing:-.01em}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]) body.skin-wburnett7{
+  --accent:#12b877;--cWR:#12b877}}
+:root[data-theme="dark"] body.skin-wburnett7{--accent:#12b877;--cWR:#12b877}
+.hero{display:flex;align-items:center;gap:14px;margin:0 0 4px}
+.hero svg{flex:0 0 auto}
+.hero .ht{min-width:0}
+.hero h1{margin:0}
 .av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
  border-left:3px solid var(--muted)}
 .live .av{cursor:pointer}
@@ -201,6 +223,25 @@ const PRESETS = {
         earliest:{RB:5,QB:8,K:14,DEF:14},caps:{QB:2,TE:3,K:1,DEF:1,RB:7,WR:7},max:{}}
 };
 const POS = ["QB","RB","WR","TE","K","DEF"];
+
+// Original artwork, drawn inline so it survives a strict content policy and
+// needs no network. Not a likeness of anything.
+const JALAPENO = '<svg width="58" height="58" viewBox="0 0 64 64" role="img" '+
+  'aria-label="cartoon jalapeno"><path d="M38 12c6-3 13-2 16 3 1 2-2 3-4 2-3-2-7-2-10 0z" '+
+  'fill="#2f7d32"/><path d="M40 16c8 6 10 18 5 27-5 10-16 15-24 12-7-3-9-11-6-19 '+
+  '4-10 14-19 25-20z" fill="#1faa4b"/><path d="M43 21c5 6 6 16 2 23-4 8-12 13-19 12 '+
+  '7-1 13-6 16-13 4-8 4-16 1-22z" fill="#15803d"/><ellipse cx="30" cy="33" rx="4" '+
+  'ry="5" fill="#fff"/><ellipse cx="41" cy="31" rx="4" ry="5" fill="#fff"/>'+
+  '<circle cx="30.5" cy="34" r="2.1" fill="#111"/><circle cx="41.5" cy="32" r="2.1" '+
+  'fill="#111"/><path d="M28 44c4 3 9 3 13-1" stroke="#0b4d20" stroke-width="2.4" '+
+  'fill="none" stroke-linecap="round"/><path d="M36 8c1-3 4-5 7-4-2 1-3 3-3 5z" '+
+  'fill="#2f7d32"/></svg>';
+
+// Optional per-manager skin: body class, page title, and a mascot.
+const SKINS = {
+  wburnett7: { cls: "skin-wburnett7", title: "Jalen Hurts RB2", art: JALAPENO,
+               sub: "Kelly green, and a pepper with opinions." }
+};
 const BOT_CAPS = {QB:2,TE:2,RB:6,WR:6,K:1,DEF:1};
 
 let S = null;
@@ -447,20 +488,29 @@ function render(){
     return g>=25 ? "Your strategy is expensive here: "+t[0].n+" ("+t[0].p+") is worth "+
       g.toFixed(0)+" more points, but "+t[0].note : "";
   })();
+  const sk = SKINS[S.me];
+  const meta = esc(S.me)+' &middot; slot '+S.slot+' &middot; round '+r.rnd+
+    ', pick '+r.pk+' &middot; '+PRESETS[S.preset].label;
   app.innerHTML=
-    '<h1>Mock draft room</h1><p class="sub">'+esc(S.me)+' &middot; slot '+S.slot+
-      ' &middot; round '+r.rnd+', pick '+r.pk+' &middot; '+PRESETS[S.preset].label+'</p>'+
+    (sk ? '<div class="hero">'+sk.art+'<div class="ht"><h1>'+esc(sk.title)+'</h1>'+
+          '<p class="sub">'+meta+'</p></div></div>'
+        : '<h1>Mock draft room</h1><p class="sub">'+meta+'</p>')+
     (warn?'<div class="warn">'+esc(warn)+'</div>':'')+
     (live?'<div class="turn">YOUR PICK &mdash; click a player to draft him</div>'
         :'<div class="wait">'+esc(onClock)+' is picking&hellip;</div>')+
     '<div class="grid2"><div><h2>Take one of these</h2>'+
-      r.ok.map((x,i)=>'<div class="rec'+(i===0?' top':'')+'"'+
+      '<div class="recs">'+r.ok.map((x,i)=>
+        '<div class="rec c'+x.p+(i===0?' top':'')+'"'+
         (live?' data-act="take" data-arg="'+esc(x.i)+'"':'')+'>'+
-        '<span class="ps">'+x.p+'</span><span class="nm">'+esc(x.n)+'</span>'+
-        '<span class="num">VOR '+x.v.toFixed(0)+'</span>'+
-        '<span class="num">'+(x.cost>0?'costs '+x.cost.toFixed(0):'best')+'</span>'+
-        '<span class="num">#'+x.r+'</span>'+
-        '<span class="num">'+x.surv+'% back</span></div>').join('')+
+        '<span class="ps">'+x.p+'</span>'+
+        '<span class="nm">'+esc(x.n)+'</span>'+
+        '<div class="mets">'+
+          '<span>VOR <b>'+x.v.toFixed(0)+'</b></span>'+
+          '<span>'+(x.cost>0?'costs <b>'+x.cost.toFixed(0)+'</b>'
+                            :'<b>best available</b>')+'</span>'+
+          '<span>board <b>#'+x.r+'</b></span>'+
+          '<span><b>'+x.surv+'%</b> still there</span>'+
+        '</div></div>').join('')+'</div>'+
       r.no.map(x=>'<div class="blocked">'+esc(x.n)+' ('+x.p+') &mdash; '+esc(x.note)+'</div>').join('')+
       '<p style="margin-top:12px"><button data-act="auto">Take the top one for me</button> '+
       '<button data-act="reset">Start over</button></p></div>'+
@@ -513,10 +563,16 @@ function renderSetup(){
 }
 // Picking your name seats you where Sleeper actually put you. You can still
 // override it to rehearse a different seat.
+function skin(name){
+  // Applied to <body> so a skin only has to override tokens, and so it
+  // previews on the setup screen rather than appearing after you commit.
+  document.body.className = (SKINS[name] && SKINS[name].cls) || "";
+}
 function setMe(v){
   pick_me=v;
   const i=DATA.managers.indexOf(v);
   if(i>=0) pick_slot=i+1;
+  skin(v);
   renderSetup();
 }
 function setSlot(n){ pick_slot=n; renderSetup(); }
