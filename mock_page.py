@@ -180,13 +180,13 @@ body.skin-wburnett7 h1{color:#00915c;letter-spacing:-.01em}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]) body.skin-wburnett7{
   --accent:#12b877;--cWR:#12b877}}
 :root[data-theme="dark"] body.skin-wburnett7{--accent:#12b877;--cWR:#12b877}
-.hero{display:flex;align-items:center;gap:16px;margin:0 0 6px}
-.hero img{flex:0 0 auto;max-width:230px;max-height:230px;border-radius:10px;
+/* Always stacked: image on top, heading beneath, at every width. */
+.hero{display:flex;flex-direction:column;align-items:flex-start;gap:14px;
+ margin:0 0 8px}
+.hero img{max-width:100%;max-height:460px;border-radius:12px;
  border:1px solid var(--hairline);display:block}
-.hero .ht{min-width:0}
+.hero .ht{min-width:0;width:100%}
 .hero h1{margin:0}
-@media(max-width:620px){.hero{flex-direction:column;align-items:flex-start}
- .hero img{max-width:100%}}
 .av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
  border-left:3px solid var(--muted)}
 .live .av{cursor:pointer}
