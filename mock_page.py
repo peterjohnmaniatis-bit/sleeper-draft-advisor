@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Build a self-contained mock-draft page that needs no install and no network.
 
     python mock_page.py        # -> out/mock-draft.html
@@ -65,6 +65,190 @@ def collect():
         "slots": slots,
         "eligible": {s: sorted(SLOT_ELIGIBILITY.get(s, [])) for s in set(slots)},
     }
+
+
+# Every strategy the survey confirmed as a genuinely named approach, with the
+# rules it implies and a grade against THIS league specifically: 12-team full
+# PPR, one QB, two flex spots, five bench spots, rolling waiver priority.
+# A grade is about fit here, not about whether the strategy is any good.
+STRATEGIES = [
+    {"key": "best", "label": "Best available", "grade": "A-",
+     "one": "No positional rules. Always take the most valuable player left.",
+     "detail": "Also called Best Player Available or Value-Based Drafting. You "
+               "rank everyone by value over replacement and take the top of the "
+               "board every time, letting roster shape sort itself out.",
+     "verdict": "Hard to beat as a default. It cannot be wrong about a player, "
+                "only about shape, and this league's two flex spots forgive "
+                "shape. It will not stop you taking a quarterback in round 3, "
+                "which is the one mistake worth ruling out here.",
+     "rules": {"earliest": {"K": 13, "DEF": 13},
+               "caps": {"QB": 2, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7}}},
+
+    {"key": "hero_rb", "label": "Hero RB", "grade": "A",
+     "one": "Exactly one elite back early, then receivers until round 6.",
+     "detail": "One big-name running back inside the first two rounds, then no "
+               "RB again for several rounds while you take three or four "
+               "receivers, then RB2 from round 6 onward and late darts. The "
+               "defining feature is exactly one early back, not the specific "
+               "round he comes in.",
+     "verdict": "Close to purpose-built for this league. Two flex spots in full "
+                "PPR reward the receiver run in rounds 2-5, the one early back "
+                "covers the fact that rolling waivers make in-season RB repair "
+                "unreliable, and it only needs two or three speculative backs "
+                "late, which a five-man bench can actually hold.",
+     "rules": {"earliest": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7},
+               "max": {"RB": [4, 1]}}},
+
+    {"key": "late_qb", "label": "Late-Round QB", "grade": "A",
+     "one": "No quarterback before round 8. Everything else is best available.",
+     "detail": "JJ Zachariason's approach, and the canonical name. In a "
+               "one-quarterback league only twelve start, so the gap between "
+               "the best QB and the twelfth is small while the gap between "
+               "the best back and the thirtieth is enormous. Spend early "
+               "capital where the gaps are.",
+     "verdict": "The single sharpest edge available to you, because a quarter "
+                "of round three in this league goes to quarterbacks every "
+                "year. Three rivals hand you the backs and receivers they pass "
+                "on. One adjustment: the standard version says carry two late "
+                "QBs and play matchups, but that is 40% of a five-man bench "
+                "here, so take one around rounds 8-11 you intend to start.",
+     "rules": {"earliest": {"QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7}}},
+
+    {"key": "mod_zero_rb", "label": "Modified Zero RB", "grade": "B+",
+     "one": "No back before round 4. Receivers first, then backs from the middle.",
+     "detail": "A relaxed Zero RB that pulls the first back forward and shrinks "
+               "the late stockpile: fade RB for the first three rounds, take "
+               "three receivers in the first four, and have your first real "
+               "back by rounds 4-6.",
+     "verdict": "The only build in the Zero RB family that survives this "
+                "league. Getting a back by round 4-6 means two or three late "
+                "darts rather than five or six, which is the difference "
+                "between fitting on a five-man bench and not. It also does not "
+                "stake the season on winning rolling-priority waiver claims.",
+     "rules": {"earliest": {"RB": 4, "QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7},
+               "max": {"RB": [6, 2]}}},
+
+    {"key": "deadzone", "label": "RB Dead Zone", "grade": "B+",
+     "one": "Backs early or late, never in rounds 3 to 6.",
+     "detail": "The dead zone is the band where committee backs with no "
+               "guaranteed volume go at prices that assume they have it. This "
+               "build takes running backs at the top of the draft or at the "
+               "bottom and refuses to pay in the middle.",
+     "verdict": "A rule rather than a shape, and a good one here. It is "
+                "compatible with almost everything else on this list and it "
+                "targets the exact band where your league's worst picks have "
+                "historically been made.",
+     "rules": {"earliest": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7},
+               "banned": {"RB": [3, 6]}}},
+
+    {"key": "barbell", "label": "Barbell RB", "grade": "B",
+     "one": "Two elite backs early, nothing at RB until round 9, then darts.",
+     "detail": "Adam Levitan's build. Load both ends and skip the middle: two "
+               "backs inside the first three rounds taken off the top of the "
+               "board, receivers and a tight end through rounds 4-8, then late "
+               "picks sprayed at ambiguous backfields.",
+     "verdict": "The early half fits well, since two elite backs is real "
+                "insurance where rolling waivers make repair unreliable. The "
+                "late half strains a five-man bench, which cannot hold the "
+                "spread of lottery tickets the build wants.",
+     "rules": {"earliest": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7},
+               "max": {"RB": [8, 2]}}},
+
+    {"key": "late_te", "label": "Late-Round TE", "grade": "B",
+     "one": "No tight end before round 8. Take the position last.",
+     "detail": "Treat tight end the way late-round QB treats quarterback: the "
+               "gap between the sixth-best and the fifteenth is small, so pay "
+               "nothing and stream if it goes wrong.",
+     "verdict": "Correct on the numbers here. An elite tight end is worth "
+                "about 32 points over replacement in this scoring, against 103 "
+                "for a back. The risk is that tight end is only the fourth-most "
+                "replaceable position on your waiver wire, so a miss lingers.",
+     "rules": {"earliest": {"TE": 8, "QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7}}},
+
+    {"key": "hero_wr", "label": "Hero WR", "grade": "B-",
+     "one": "One elite receiver early, then backs until round 5.",
+     "detail": "The mirror of Hero RB. Anchor with a top receiver, then take "
+               "running backs while everyone else is chasing pass catchers.",
+     "verdict": "Workable and genuinely contrarian in a PPR league, but it "
+                "fights the scoring. Two flex spots mean you want receiver "
+                "volume, and this build spends the rounds where that volume is "
+                "cheapest on the position that is hardest to replace anyway.",
+     "rules": {"earliest": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7},
+               "max": {"WR": [4, 1]}}},
+
+    {"key": "robust_rb", "label": "Robust RB", "grade": "B-",
+     "one": "Backs with your first two or three picks, receivers after.",
+     "detail": "Corner the top running back tiers. Two backs in the first two "
+               "rounds at minimum, often three of the first five, then fill "
+               "receiver through the middle.",
+     "verdict": "Defensible, and the two flex spots inflate RB demand enough to "
+                "justify it. But full PPR with two starting receivers plus two "
+                "flexes means opening RB-RB-RB leaves you starting WR3-quality "
+                "receivers all year, and the ones you passed do not come back "
+                "in a twelve-team league. Also concentrates injury risk in the "
+                "position that suffers most of it.",
+     "rules": {"earliest": {"QB": 7, "TE": 6, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 7, "WR": 6},
+               "max": {"WR": [3, 1]}}},
+
+    {"key": "elite_te", "label": "Elite TE", "grade": "C+",
+     "one": "Take a top tight end in the first three rounds.",
+     "detail": "Buy the one position where a single player can be a weekly "
+               "advantage over every other roster, and accept a weaker start "
+               "elsewhere to get him.",
+     "verdict": "The premise is real but the price is wrong here. Elite tight "
+                "end is worth about a third of an elite back over replacement "
+                "in this scoring, and your league has shown no relationship "
+                "between when a tight end is drafted and how the season goes.",
+     "rules": {"earliest": {"QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7}}},
+
+    {"key": "elite_qb", "label": "Elite QB", "grade": "C-",
+     "one": "Take one of the top quarterbacks in rounds 2 to 4.",
+     "detail": "The named foil to Late-Round QB. Pay up for a quarterback who "
+               "wins you weeks outright, and skip a backup entirely to get the "
+               "bench spot back.",
+     "verdict": "Playable but the format argues against it. One starting "
+                "quarterback and no superflex means there is no demand "
+                "inflating the position, and the round 2-3 cost lands directly "
+                "on the RB and WR bodies this lineup needs most. This is the "
+                "thing you have done in four of five seasons.",
+     "rules": {"earliest": {"K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 6, "WR": 7}}},
+
+    {"key": "zero_rb", "label": "Zero RB", "grade": "D",
+     "one": "No running back before round 5. Backs come from waivers.",
+     "detail": "Shawn Siegele's original. Fade running back entirely early, "
+               "load receivers and a tight end, then take many late lottery "
+               "tickets and win the waiver wire when a backfield opens up.",
+     "verdict": "Ruled out here, and not because the strategy is bad. It needs "
+                "bench space to stash lottery tickets and you have five spots "
+                "that also cover byes. It needs to win the waiver race when a "
+                "backfield opens, and rolling priority means you cannot outbid "
+                "anyone. Running back is also the least replaceable position "
+                "on your wire, at a 15% hit rate.",
+     "rules": {"earliest": {"RB": 5, "QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 3, "K": 1, "DEF": 1, "RB": 7, "WR": 7}}},
+
+    {"key": "zero_wr", "label": "Zero WR", "grade": "F",
+     "one": "No receiver before round 5. Backs and a tight end first.",
+     "detail": "The inverse of Zero RB, and much rarer. Load the positions "
+               "with guaranteed volume and treat receiver as replaceable.",
+     "verdict": "The worst fit on this list. Full PPR with two starting "
+                "receivers and two flex spots means receiver volume is most of "
+                "your scoring, and receiver is the least replaceable position "
+                "on your waiver wire at a 13% hit rate. Included so you can "
+                "see what it costs.",
+     "rules": {"earliest": {"WR": 5, "QB": 8, "K": 14, "DEF": 14},
+               "caps": {"QB": 1, "TE": 2, "K": 1, "DEF": 1, "RB": 7, "WR": 7}}},
+]
 
 
 # Manager -> skin. Drop an image at assets/skin-<manager>.<png|jpg|gif|webp>
@@ -188,6 +372,30 @@ button:disabled{opacity:.45;cursor:not-allowed}
  border:1px solid var(--hairline);background:var(--surface);color:var(--ink)}
 #q:focus{outline:2px solid var(--accent);outline-offset:1px}
 .hits{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:6px}
+/* Strategy chooser: a card per approach with its grade against this league. */
+.strats{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:9px}
+.strat{border:1px solid var(--hairline);border-radius:9px;padding:10px 12px;
+ background:var(--page);cursor:pointer}
+.strat:hover{border-color:var(--accent)}
+.strat.sel{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);
+ background:var(--surface)}
+.strat .sh{display:flex;align-items:center;gap:8px}
+.strat .sn{font-weight:600;font-size:14px}
+.strat .so{margin:6px 0 0;font-size:12px;color:var(--ink-2);line-height:1.4}
+.grade{font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;
+ letter-spacing:.02em;color:#fff;background:var(--muted)}
+.grade.gA{background:#0ca30c}.grade.gB{background:#2a78d6}
+.grade.gC{background:#c98500}.grade.gD{background:#e34948}
+.grade.gF{background:#b02020}
+.sdetail{margin-top:12px;padding-top:12px;border-top:1px solid var(--grid)}
+.sdetail h4{margin:0 0 6px;font-size:15px;display:flex;align-items:center;gap:8px}
+.sdetail p{margin:0 0 8px;font-size:13.5px;color:var(--ink-2);max-width:70ch}
+.shift{background:var(--surface);border:2px solid var(--accent);border-radius:10px;
+ padding:12px 15px;margin-bottom:10px;font-size:14px;color:var(--ink)}
+.shift .sbtn{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.shift .sbtn button:first-child{background:var(--accent);color:#fff;
+ border-color:var(--accent);font-weight:600}
+
 .seat{margin:12px 0 0;padding:9px 14px;border-radius:8px;font-size:14px;
  background:var(--page);border:1px solid var(--accent);color:var(--ink)}
 .seat b{color:var(--accent)}
@@ -267,16 +475,13 @@ window.addEventListener("error",function(ev){ fail(ev.error||ev.message); });
 try{
 const DATA = __DATA__;
 
-const PRESETS = {
-  value:{label:"Best available",note:"No rules. Always takes the most valuable player left.",
-         earliest:{K:13,DEF:13},caps:{QB:2,TE:2,K:1,DEF:1,RB:6,WR:7},max:{}},
-  hero:{label:"Hero RB, late QB",note:"One anchor back early, then let running back go. No quarterback before round 8.",
-        earliest:{QB:8,TE:5,K:14,DEF:14},caps:{QB:2,TE:2,K:1,DEF:1,RB:6,WR:7},max:{RB:[5,2]}},
-  robust:{label:"Robust RB",note:"Load up on running backs early and take receivers later.",
-          earliest:{QB:7,TE:6,K:14,DEF:14},caps:{QB:2,TE:2,K:1,DEF:1,RB:7,WR:6},max:{WR:[3,1]}},
-  zero:{label:"Zero RB",note:"No running back until round 5. Receivers and a tight end first.",
-        earliest:{RB:5,QB:8,K:14,DEF:14},caps:{QB:2,TE:3,K:1,DEF:1,RB:7,WR:7},max:{}}
-};
+const STRATS = __STRATS__;
+const PRESETS = {};
+STRATS.forEach(s=>{
+  PRESETS[s.key] = Object.assign({label:s.label, note:s.one,
+    earliest:{}, caps:{}, max:{}, banned:{}}, s.rules);
+});
+const GRADE_RANK = {"A":0,"A-":1,"B+":2,"B":3,"B-":4,"C+":5,"C":6,"C-":7,"D":8,"F":9};
 const POS = ["QB","RB","WR","TE","K","DEF"];
 
 // Per-manager skins, assembled at build time. Any image is inlined as a data
@@ -307,10 +512,13 @@ function poissonBelow(k,lam){
 function counts(roster){
   const c={}; roster.forEach(p=>{c[p.p]=(c[p.p]||0)+1;}); return c;
 }
-function allowed(pos,rnd,c){
-  const d=PRESETS[S.preset];
+function allowed(pos,rnd,c,key){
+  const d=PRESETS[key||S.preset];
   if(d.earliest[pos] && rnd<d.earliest[pos])
     return [false,"not before round "+d.earliest[pos],"timing"];
+  const b=d.banned&&d.banned[pos];
+  if(b && rnd>=b[0] && rnd<=b[1])
+    return [false,"dead zone: no "+pos+" in rounds "+b[0]+"-"+b[1],"timing"];
   if(d.caps[pos]!=null && (c[pos]||0)>=d.caps[pos])
     return [false,"already have "+c[pos]+" "+pos,"cap"];
   const m=d.max[pos];
@@ -318,6 +526,28 @@ function allowed(pos,rnd,c){
     return [false,"max "+m[1]+" "+pos+" through round "+m[0],"timing"];
   return [true,"",""];
 }
+
+// Within the opening rounds, check whether a different strategy would let you
+// take someone materially better than your current one allows. Suggest it and
+// let the user decide -- never switch silently.
+function suggestShift(r){
+  if(!S || r.rnd>2 || S.shiftSkip===r.pk) return null;
+  const c=counts(S.rosters[S.me]||[]);
+  const mineBest = r.open.length ? Math.max(...r.open.map(x=>x.v)) : -1e9;
+  let best=null;
+  for(const s of STRATS){
+    if(s.key===S.preset) continue;
+    if(GRADE_RANK[s.grade] > GRADE_RANK[curStrat().grade]) continue;  // never downgrade
+    let top=-1e9, who=null;
+    POS.forEach(p=>(r.byPos[p]||[]).forEach(x=>{
+      if(allowed(p,r.rnd,c,s.key)[0] && x.v>top){ top=x.v; who=x; }
+    }));
+    const gain=top-mineBest;
+    if(gain>=20 && (!best || gain>best.gain)) best={strat:s, who:who, gain:gain};
+  }
+  return best;
+}
+function curStrat(){ return STRATS.find(s=>s.key===S.preset) || STRATS[0]; }
 const PER_POS = 6;
 // The top PER_POS at EVERY position, not the top six overall. A cross-position
 // list collapses to whichever position happens to be deepest and hides the
@@ -563,6 +793,15 @@ function render(){
             '<p class="sub">'+meta+'</p></div></div>'
         : '<h1>Mock draft room</h1><p class="sub">'+meta+'</p>')+
     (warn?'<div class="warn">'+esc(warn)+'</div>':'')+
+    (function(){ const sh=live?suggestShift(r):null; if(!sh) return "";
+      return '<div class="shift"><b>Strategy check.</b> '+esc(sh.strat.label)+
+        ' (grade '+sh.strat.grade+') would let you take <b>'+esc(sh.who.n)+'</b> ('+
+        sh.who.p+'), worth <b>'+sh.gain.toFixed(0)+' more</b> than anything '+
+        esc(curStrat().label)+' allows right now. '+esc(sh.strat.one)+
+        '<div class="sbtn"><button data-act="shiftyes" data-arg="'+sh.strat.key+
+        '">Switch to '+esc(sh.strat.label)+'</button>'+
+        '<button data-act="shiftno">Stay with '+esc(curStrat().label)+
+        '</button></div></div>'; })()+
     (live?'<div class="turn">YOUR PICK &mdash; click a player to draft him</div>'
         :'<div class="wait">'+esc(onClock)+' is picking&hellip;</div>')+
     '<h2>Take one of these</h2>'+
@@ -605,7 +844,7 @@ function render(){
     legend();
 }
 
-let pick_me=null, pick_slot=null, pick_preset="value";
+let pick_me=null, pick_slot=null, pick_preset="best";
 function renderSetup(){
   const app=document.getElementById("app");
   app.className="wrap";
@@ -626,10 +865,23 @@ function renderSetup(){
       : '<p class="note" style="margin-top:10px">Your draft slot is filled in '+
         'automatically from the real order.</p>')+
     '</div>'+
-    '<div class="card"><h3>2. Strategy</h3><div class="row">'+
-      Object.entries(PRESETS).map(([k,v])=>'<button data-act="preset" data-arg="'+k+'"'+
-        (pick_preset===k?' class="sel"':'')+'>'+v.label+'</button>').join('')+
-      '</div><p class="note">'+esc(PRESETS[pick_preset].note)+'</p></div>'+
+    '<div class="card"><h3>2. Strategy</h3>'+
+      '<p class="note" style="margin:0 0 10px">Graded against <b>this</b> league '+
+      '&mdash; 12 teams, full PPR, one quarterback, two flex spots, five bench '+
+      'spots, rolling waiver priority. The grade is about fit here, not about '+
+      'whether the strategy is any good in general.</p>'+
+      '<div class="strats">'+STRATS.map(s=>
+        '<div class="strat'+(pick_preset===s.key?' sel':'')+'" data-act="preset" '+
+        'data-arg="'+s.key+'"><div class="sh">'+
+        '<span class="grade g'+s.grade.charAt(0)+'">'+s.grade+'</span>'+
+        '<span class="sn">'+esc(s.label)+'</span></div>'+
+        '<p class="so">'+esc(s.one)+'</p></div>').join('')+'</div>'+
+      (function(){ const c=STRATS.find(s=>s.key===pick_preset)||STRATS[0];
+        return '<div class="sdetail"><h4>'+esc(c.label)+
+          ' <span class="grade g'+c.grade.charAt(0)+'">'+c.grade+'</span></h4>'+
+          '<p>'+esc(c.detail)+'</p>'+
+          '<p><b>For this league:</b> '+esc(c.verdict)+'</p></div>'; })()+
+    '</div>'+
     '<p style="margin-top:18px"><button class="primary" data-act="start"'+
       ((pick_me&&pick_slot)?'':' disabled')+'>'+
       (pick_me?'Start drafting from slot '+pick_slot:'Pick your manager to start')+
@@ -678,6 +930,12 @@ document.getElementById("app").addEventListener("click", function(ev){
     else if(a==="take") take(v);
     else if(a==="auto") autoPick();
     else if(a==="reset") reset();
+    else if(a==="shiftyes"){ const pk=S.picks.length?Math.max.apply(null,
+        S.picks.map(function(x){return x.pick;}))+1:1;
+      S.preset=v; S.shiftSkip=pk; render(); }
+    else if(a==="shiftno"){ const pk=S.picks.length?Math.max.apply(null,
+        S.picks.map(function(x){return x.pick;}))+1:1;
+      S.shiftSkip=pk; render(); }
   }catch(err){ fail(err); }
 });
 // Typing repaints only the results list, so the box keeps its value and focus.
@@ -711,6 +969,7 @@ def main():
     # inside a <script> block.
     doc = PAGE.replace("__DATA__", blob)
     doc = doc.replace("__SKINS__", json.dumps(skins(), ensure_ascii=True))
+    doc = doc.replace("__STRATS__", json.dumps(STRATEGIES, ensure_ascii=True))
     if any(ord(c) > 127 for c in doc):
         raise SystemExit("non-ASCII leaked into the page")
     OUT.parent.mkdir(exist_ok=True)
@@ -733,3 +992,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
