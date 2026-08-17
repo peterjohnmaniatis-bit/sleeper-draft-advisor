@@ -127,6 +127,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
  border:1px solid var(--hairline);background:var(--surface);color:var(--ink)}
 #q:focus{outline:2px solid var(--accent);outline-offset:1px}
 .hits{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:6px}
+.seat{margin:12px 0 0;padding:9px 14px;border-radius:8px;font-size:14px;
+ background:var(--page);border:1px solid var(--accent);color:var(--ink)}
+.seat b{color:var(--accent)}
 .av{padding:3px 8px;border-radius:5px;font-size:13px;display:flex;gap:8px;
  border-left:3px solid var(--muted)}
 .live .av{cursor:pointer}
@@ -487,20 +490,33 @@ function renderSetup(){
     '<div class="card"><h3>1. Which manager are you?</h3><div class="row">'+
       DATA.managers.map(m=>'<button data-m="'+esc(m)+'" data-act="me"'+
         (m===pick_me?' class="sel"':'')+'>'+esc(m)+'</button>').join('')+
-    '</div></div>'+
-    '<div class="card"><h3>2. Draft slot</h3><div class="row">'+
-      Array.from({length:DATA.teams},(_,i)=>'<button data-act="slot" data-arg="'+(i+1)+'"'+
-        (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'. '+
-        esc(DATA.managers[i])+'</button>').join('')+
-      '</div><p class="note">This is the real draft order. Choosing your name '+
-      'seats you correctly; pick another slot to rehearse from somewhere else.</p></div>'+
-    '<div class="card"><h3>3. Strategy</h3><div class="row">'+
+    '</div>'+
+    // Picking a name seats you. Showing twelve slot buttons as a numbered step
+    // made that read as another decision to make, so the seat is now stated as
+    // a fact and the override is tucked away.
+    (pick_me
+      ? '<p class="seat">Seated at <b>slot '+pick_slot+'</b> of '+DATA.teams+
+        ', where you were drawn in the real order.</p>'
+      : '<p class="note" style="margin-top:10px">Your draft slot is filled in '+
+        'automatically from the real order.</p>')+
+    '</div>'+
+    '<div class="card"><h3>2. Strategy</h3><div class="row">'+
       Object.entries(PRESETS).map(([k,v])=>'<button data-act="preset" data-arg="'+k+'"'+
         (pick_preset===k?' class="sel"':'')+'>'+v.label+'</button>').join('')+
       '</div><p class="note">'+esc(PRESETS[pick_preset].note)+'</p></div>'+
     '<p style="margin-top:18px"><button class="primary" data-act="start"'+
-      ((pick_me&&pick_slot)?'':' disabled')+'>Start drafting</button></p>'+
-    '<p class="note">Nothing is sent anywhere. The whole draft runs in your browser.</p>';
+      ((pick_me&&pick_slot)?'':' disabled')+'>'+
+      (pick_me?'Start drafting from slot '+pick_slot:'Pick your manager to start')+
+      '</button></p>'+
+    '<details class="key"><summary>Rehearse from a different seat</summary>'+
+      '<div class="row" style="margin-top:8px">'+
+      Array.from({length:DATA.teams},(_,i)=>'<button data-act="slot" data-arg="'+(i+1)+'"'+
+        (pick_slot===i+1?' class="sel"':'')+'>'+(i+1)+'. '+
+        esc(DATA.managers[i])+'</button>').join('')+
+      '</div><p class="note">Only for practice. On the night you will be in the '+
+      'seat shown above.</p></details>'+
+    '<p class="note" style="margin-top:14px">Nothing is sent anywhere. '+
+      'The whole draft runs in your browser.</p>';
 }
 // Picking your name seats you where Sleeper actually put you. You can still
 // override it to rehearse a different seat.
