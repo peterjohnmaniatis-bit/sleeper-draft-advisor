@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from draft import DRAFT_REPLACEMENT, build_board, opponent_tendencies, setup
-from model import Players, _load
+from model import RAW, Players, _load
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out" / "mock-draft.html"
@@ -36,8 +36,20 @@ def collect():
     args = types.SimpleNamespace(slot=None, season=None, mock=True)
     state = setup(args)
 
+    # Projected carries, for the Konami filter. Already in the cached
+    # projections -- no extra source needed.
+    rush = {}
+    cache = RAW / f"projections_{state.season}_season.json"
+    if cache.exists():
+        for row in json.loads(cache.read_text(encoding="utf-8")):
+            pid = str(row.get("player_id") or "")
+            ra = ((row.get("stats") or {}).get("rush_att")) or 0
+            if pid and ra:
+                rush[pid] = round(float(ra))
+
     board = [{"i": p["player_id"], "n": p["name"], "p": p["pos"],
-              "j": round(p["proj"], 1), "v": round(p["vor"], 1), "r": p["rank"]}
+              "j": round(p["proj"], 1), "v": round(p["vor"], 1), "r": p["rank"],
+              "ru": rush.get(p["player_id"], 0)}
              for p in state.board[:BOARD_DEPTH]]
 
     tend, league = opponent_tendencies()
@@ -390,6 +402,12 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .sdetail{margin-top:12px;padding-top:12px;border-top:1px solid var(--grid)}
 .sdetail h4{margin:0 0 6px;font-size:15px;display:flex;align-items:center;gap:8px}
 .sdetail p{margin:0 0 8px;font-size:13.5px;color:var(--ink-2);max-width:70ch}
+.konami{margin-top:12px;padding-top:12px;border-top:1px solid var(--grid);
+ display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.konami button{white-space:nowrap}
+.konami .note{flex:1;min-width:260px;max-width:64ch}
+.rec .mets .run{color:var(--ink-2)}
+.rec .mets .run.hot b{color:var(--good)}
 .shift{background:var(--surface);border:2px solid var(--accent);border-radius:10px;
  padding:12px 15px;margin-bottom:10px;font-size:14px;color:var(--ink)}
 .shift .sbtn{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
@@ -491,6 +509,8 @@ const BOT_CAPS = {QB:2,TE:2,RB:6,WR:6,K:1,DEF:1};
 
 let S = null;
 let query = "";
+let konami = false;
+const KONAMI_FLOOR = 100;   // carries; the tier where the 93% hit rate lives
 const esc = t => String(t).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -530,8 +550,14 @@ function allowed(pos,rnd,c,key){
 // Within the opening rounds, check whether a different strategy would let you
 // take someone materially better than your current one allows. Suggest it and
 // let the user decide -- never switch silently.
+// Through round 5, so four picks are on the board and the fifth is still open
+// to a pivot.
+const SHIFT_THROUGH = 5;
 function suggestShift(r){
-  if(!S || r.rnd>2 || S.shiftSkip===r.pk) return null;
+  if(!S || r.rnd>SHIFT_THROUGH || S.shiftSkip===r.pk) return null;
+  // Value gaps compress as the board thins, so a fixed threshold would stop
+  // firing after round 2 even when the switch is still worth making.
+  const need = r.rnd<=2 ? 20 : 12;
   const c=counts(S.rosters[S.me]||[]);
   const mineBest = r.open.length ? Math.max(...r.open.map(x=>x.v)) : -1e9;
   let best=null;
@@ -543,7 +569,7 @@ function suggestShift(r){
       if(allowed(p,r.rnd,c,s.key)[0] && x.v>top){ top=x.v; who=x; }
     }));
     const gain=top-mineBest;
-    if(gain>=20 && (!best || gain>best.gain)) best={strat:s, who:who, gain:gain};
+    if(gain>=need && (!best || gain>best.gain)) best={strat:s, who:who, gain:gain};
   }
   return best;
 }
@@ -568,6 +594,13 @@ function recommend(){
     const [ok,note,kind]=allowed(p.p,rnd,c);
     byPos[p.p].push({...p,ok,note,kind,surv:Math.round(surv*100)});
   }
+  // Konami: rank quarterbacks by projected carries rather than by projected
+  // points. The claim it rests on is that rushing volume predicts a top-12
+  // finish better than passing does -- 26 of 28 QBs with 100+ carries have
+  // finished top-12. Applied as a re-ordering of the QB column only; it does
+  // not touch any other position or invent a points adjustment.
+  if(konami && byPos.QB) byPos.QB.sort((a,b)=>(b.ru||0)-(a.ru||0));
+
   // Cost is measured against the best player the strategy allows anywhere on
   // the board, so it stays comparable across positions.
   const open=[];
@@ -740,6 +773,14 @@ function legend(){
       'strategy blocks that position, with the reason beside the heading (for '+
       'example "not before round 8"). They stay clickable on purpose &mdash; '+
       'the rule is there to show you a cost, not to stop you.</td></tr>'+
+    '<tr><td><b>carries</b></td><td>Shown on quarterbacks only: projected '+
+      'rushing attempts. Green means '+KONAMI_FLOOR+' or more, the tier where '+
+      '26 of 28 quarterbacks have finished top-12. Turning the Konami filter on '+
+      'ranks the quarterback column by this instead of by projected points.</td></tr>'+
+    '<tr><td><b>Strategy check</b></td><td>Through round '+SHIFT_THROUGH+', if a '+
+      'different strategy of equal or better grade would let you take someone '+
+      'materially better than yours allows, you get asked whether to switch. It '+
+      'never switches by itself and never suggests a worse-graded approach.</td></tr>'+
     '<tr><td><b>Red</b></td><td>Reserved for warnings: the banner when your '+
       'strategy is blocking someone clearly better, and the reason text on a '+
       'blocked column.</td></tr>'+
@@ -824,6 +865,8 @@ function render(){
             '<span>#'+x.r+'</span>'+
             '<span>'+(x.cost>0?'-<b>'+x.cost.toFixed(0)+'</b>':'<b>best</b>')+'</span>'+
             '<span><b>'+x.surv+'%</b> back</span>'+
+            (pos==="QB"&&x.ru ? '<span class="run'+(x.ru>=KONAMI_FLOOR?' hot':'')+
+              '"><b>'+x.ru+'</b> carries</span><span></span>' : '')+
           '</div></div>').join('')+'</div>';
     }).join('')+'</div>'+
     '<p style="margin:0 0 6px"><button data-act="auto">Take the best one for me</button> '+
@@ -876,6 +919,13 @@ function renderSetup(){
         '<span class="grade g'+s.grade.charAt(0)+'">'+s.grade+'</span>'+
         '<span class="sn">'+esc(s.label)+'</span></div>'+
         '<p class="so">'+esc(s.one)+'</p></div>').join('')+'</div>'+
+      '<div class="konami"><button data-act="konami">'+
+        (konami?'&#10003; Konami filter ON':'Konami filter OFF')+'</button>'+
+        '<span class="note">Ranks quarterbacks by projected <b>carries</b> '+
+        'instead of projected points. Rushing volume predicts a top-12 finish '+
+        'better than passing does &mdash; 26 of 28 QBs with '+KONAMI_FLOOR+
+        '+ carries have finished top-12. Works alongside any strategy above; '+
+        'it only re-orders the quarterback column.</span></div>'+
       (function(){ const c=STRATS.find(s=>s.key===pick_preset)||STRATS[0];
         return '<div class="sdetail"><h4>'+esc(c.label)+
           ' <span class="grade g'+c.grade.charAt(0)+'">'+c.grade+'</span></h4>'+
@@ -936,6 +986,7 @@ document.getElementById("app").addEventListener("click", function(ev){
     else if(a==="shiftno"){ const pk=S.picks.length?Math.max.apply(null,
         S.picks.map(function(x){return x.pick;}))+1:1;
       S.shiftSkip=pk; render(); }
+    else if(a==="konami"){ konami=!konami; S?render():renderSetup(); }
   }catch(err){ fail(err); }
 });
 // Typing repaints only the results list, so the box keeps its value and focus.
