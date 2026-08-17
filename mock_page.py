@@ -569,9 +569,48 @@ function suggestShift(r){
       if(allowed(p,r.rnd,c,s.key)[0] && x.v>top){ top=x.v; who=x; }
     }));
     const gain=top-mineBest;
-    if(gain>=need && (!best || gain>best.gain)) best={strat:s, who:who, gain:gain};
+    if(gain>=need && (!best || gain>best.gain))
+      best={strat:s, who:who, gain:gain, kind:"value"};
   }
-  return best;
+  if(best) return best;
+
+  // Second trigger, and the one that matters from an unrestricted plan. If you
+  // are drafting with no rules, nothing can ever "allow more" than you already
+  // have -- so instead, look at what you have actually taken and offer to lock
+  // in the graded strategy your own picks already match.
+  const mine=S.picks.filter(p=>p.mgr===S.me);
+  if(!mine.length || !isLoose(S.preset)) return null;
+  const fits=STRATS.filter(s=>s.key!==S.preset &&
+      GRADE_RANK[s.grade]<=GRADE_RANK["B"] && !isLoose(s.key) && fitsHistory(s.key));
+  fits.sort((a,b)=>GRADE_RANK[a.grade]-GRADE_RANK[b.grade]);
+  return fits.length ? {strat:fits[0], who:null, gain:0, kind:"shape",
+                        n:mine.length} : null;
+}
+const SKILL4=["QB","RB","WR","TE"];
+// "Loose" means the plan imposes no timing rule on a skill position, so it can
+// never be the thing standing between you and a better player.
+function isLoose(key){
+  const d=PRESETS[key];
+  return !SKILL4.some(p=>d.earliest[p]||(d.banned&&d.banned[p])||d.max[p]);
+}
+// Would every pick you have already made have been legal under this plan?
+function fitsHistory(key){
+  const c={};
+  const mine=S.picks.filter(p=>p.mgr===S.me).sort((a,b)=>a.pick-b.pick);
+  for(const p of mine){
+    if(!allowed(p.p, slotOnClock(p.pick)[1], c, key)[0]) return false;
+    c[p.p]=(c[p.p]||0)+1;
+  }
+  return true;
+}
+function ruleText(key){
+  const d=PRESETS[key], bits=[];
+  SKILL4.forEach(p=>{ if(d.earliest[p]) bits.push("no "+p+" before round "+d.earliest[p]); });
+  SKILL4.forEach(p=>{ const b=d.banned&&d.banned[p];
+    if(b) bits.push("no "+p+" in rounds "+b[0]+"-"+b[1]); });
+  SKILL4.forEach(p=>{ const m=d.max[p];
+    if(m) bits.push("at most "+m[1]+" "+p+" through round "+m[0]); });
+  return bits.join("; ");
 }
 function curStrat(){ return STRATS.find(s=>s.key===S.preset) || STRATS[0]; }
 const PER_POS = 6;
@@ -835,13 +874,19 @@ function render(){
         : '<h1>Mock draft room</h1><p class="sub">'+meta+'</p>')+
     (warn?'<div class="warn">'+esc(warn)+'</div>':'')+
     (function(){ const sh=live?suggestShift(r):null; if(!sh) return "";
-      return '<div class="shift"><b>Strategy check.</b> '+esc(sh.strat.label)+
-        ' (grade '+sh.strat.grade+') would let you take <b>'+esc(sh.who.n)+'</b> ('+
-        sh.who.p+'), worth <b>'+sh.gain.toFixed(0)+' more</b> than anything '+
-        esc(curStrat().label)+' allows right now. '+esc(sh.strat.one)+
+      const body = sh.kind==="value"
+        ? esc(sh.strat.label)+' (grade '+sh.strat.grade+') would let you take '+
+          '<b>'+esc(sh.who.n)+'</b> ('+sh.who.p+'), worth <b>'+
+          sh.gain.toFixed(0)+' more</b> than anything '+esc(curStrat().label)+
+          ' allows right now. '+esc(sh.strat.one)
+        : 'Your first '+sh.n+' pick'+(sh.n>1?'s':'')+' already match <b>'+
+          esc(sh.strat.label)+'</b> (grade '+sh.strat.grade+'). '+
+          esc(sh.strat.one)+' Locking it in holds the line for the rest of the '+
+          'draft: '+esc(ruleText(sh.strat.key))+'.';
+      return '<div class="shift"><b>Strategy check.</b> '+body+
         '<div class="sbtn"><button data-act="shiftyes" data-arg="'+sh.strat.key+
-        '">Switch to '+esc(sh.strat.label)+'</button>'+
-        '<button data-act="shiftno">Stay with '+esc(curStrat().label)+
+        '">'+(sh.kind==="shape"?'Lock in ':'Switch to ')+esc(sh.strat.label)+
+        '</button><button data-act="shiftno">Stay with '+esc(curStrat().label)+
         '</button></div></div>'; })()+
     (live?'<div class="turn">YOUR PICK &mdash; click a player to draft him</div>'
         :'<div class="wait">'+esc(onClock)+' is picking&hellip;</div>')+
