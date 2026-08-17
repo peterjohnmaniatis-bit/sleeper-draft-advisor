@@ -145,19 +145,29 @@ button:disabled{opacity:.45;cursor:not-allowed}
 /* Six recommendations as a 3 x 2 grid of cards. A single flex row per player
    had no room for four metrics without them collapsing into a strip of
    unlabelled digits. */
-.recs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
-@media(max-width:1040px){.recs{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:620px){.recs{grid-template-columns:1fr}}
-.rec{display:block;padding:11px 13px;border-radius:9px;background:var(--surface);
- border:1px solid var(--hairline);border-left:3px solid var(--muted)}
+/* One column per position, six deep. Every player on screen is pickable. */
+.board6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:0 0 14px}
+@media(max-width:1240px){.board6{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:760px){.board6{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.board6{grid-template-columns:1fr}}
+.poscol h3{margin:0 0 6px;font-size:12px;letter-spacing:.06em;
+ border-left:3px solid var(--muted);padding-left:7px}
+.poscol h3.cQB{border-left-color:var(--cQB)}.poscol h3.cRB{border-left-color:var(--cRB)}
+.poscol h3.cWR{border-left-color:var(--cWR)}.poscol h3.cTE{border-left-color:var(--cTE)}
+.poscol h3.cK{border-left-color:var(--cK)}.poscol h3.cDEF{border-left-color:var(--cDEF)}
+.poscol h3 .blk{text-transform:none;letter-spacing:0;font-weight:400;
+ color:var(--neg);font-size:11px}
+.rec{display:block;padding:8px 10px;border-radius:8px;background:var(--surface);
+ border:1px solid var(--hairline);border-left:3px solid var(--muted);margin-bottom:6px}
 .rec.top{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.rec.off{opacity:.5}
 .live .rec{cursor:pointer}
-.live .rec:hover{background:var(--page);border-color:var(--accent)}
-.rec .ps{font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--muted)}
-.rec .nm{display:block;font-weight:600;font-size:15px;line-height:1.25;
- white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
-.rec .mets{display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;margin-top:9px;
- font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.live .rec:hover{opacity:1;background:var(--page);border-color:var(--accent)}
+.rec .nm{display:block;font-weight:600;font-size:13.5px;line-height:1.25;
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rec .mets{display:grid;grid-template-columns:1fr auto;gap:1px 8px;margin-top:5px;
+ font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.rec .mets span:nth-child(even){text-align:right}
 .rec .mets b{color:var(--ink);font-weight:600}
 .blocked{opacity:.55;font-size:13px;padding:3px 12px}
 .chip{display:inline-block;background:var(--surface);border:1px solid var(--hairline);
@@ -298,27 +308,37 @@ function allowed(pos,rnd,c){
     return [false,"max "+m[1]+" "+pos+" through round "+m[0],"timing"];
   return [true,"",""];
 }
+const PER_POS = 6;
+// The top PER_POS at EVERY position, not the top six overall. A cross-position
+// list collapses to whichever position happens to be deepest and hides the
+// choice you are actually making.
 function recommend(){
   const pk=S.picks.length? Math.max(...S.picks.map(p=>p.pick))+1 : 1;
   const [,rnd]=slotOnClock(pk);
   const nx=nextOwn(pk+1), gap=nx?nx-pk:0;
   const c=counts(S.rosters[S.me]||[]);
-  const q={}, out=[];
+  const q={}, byPos={};
+  POS.forEach(p=>{ byPos[p]=[]; });
   for(const p of DATA.board){
     if(S.taken.has(p.i)) continue;
-    q[p.p]=(q[p.p]||0)+1;
+    q[p.p]=(q[p.p]||0)+1;                       // queue rank at his position
+    if(!byPos[p.p] || byPos[p.p].length>=PER_POS) continue;
     const rate=(DATA.league[String(rnd)]||{})[p.p] || .25;
     const surv=poissonBelow(q[p.p], gap*rate);
     const [ok,note,kind]=allowed(p.p,rnd,c);
-    const score=p.v + Math.max(0,p.v)*(1-surv)*.5 - (ok?0:1e6);
-    out.push({...p,ok,note,kind,surv:Math.round(surv*100),score});
-    if(out.length>300) break;
+    byPos[p.p].push({...p,ok,note,kind,surv:Math.round(surv*100)});
   }
-  out.sort((a,b)=>b.score-a.score);
-  const ok=out.filter(x=>x.ok).slice(0,6), no=out.filter(x=>!x.ok).slice(0,2);
-  if(ok.length){ const best=Math.max(...ok.map(x=>x.v));
-    ok.forEach(x=>x.cost=Math.max(0,best-x.v)); }
-  return {pk,rnd,gap,ok,no};
+  // Cost is measured against the best player the strategy allows anywhere on
+  // the board, so it stays comparable across positions.
+  const open=[];
+  POS.forEach(p=>byPos[p].forEach(x=>{ if(x.ok) open.push(x); }));
+  const best=open.length?Math.max(...open.map(x=>x.v)):0;
+  POS.forEach(p=>byPos[p].forEach(x=>{ x.cost=Math.max(0,best-x.v); }));
+  const blocked=POS.map(p=>byPos[p][0]).filter(x=>x&&!x.ok);
+  return {pk,rnd,gap,byPos,open,blocked,
+          top:open.slice().sort((a,b)=>
+            (b.v+Math.max(0,b.v)*(1-b.surv/100)*.5)-
+            (a.v+Math.max(0,a.v)*(1-a.surv/100)*.5))[0]};
 }
 function botPick(mgr,rnd){
   const c=counts(S.rosters[mgr]||[]);
@@ -360,7 +380,7 @@ function take(id){
   record(pk,p,S.me);
   runBots();
 }
-function autoPick(){ const r=recommend(); if(r.ok.length) take(r.ok[0].i); }
+function autoPick(){ const r=recommend(); if(r.top) take(r.top.i); }
 
 function boardHTML(){
   const byPick={}; S.picks.forEach(p=>byPick[p.pick]=p);
@@ -502,9 +522,9 @@ function render(){
   app.className="wrap"+(live?" live":"");
   const onClock=DATA.managers[slot-1];
   const warn=(()=>{
-    const t=r.no.filter(x=>x.kind==="timing");
-    if(!r.ok.length||!t.length) return "";
-    const g=t[0].v-Math.max(...r.ok.map(x=>x.v));
+    const t=(r.blocked||[]).filter(x=>x.kind==="timing").sort((a,b)=>b.v-a.v);
+    if(!r.open.length||!t.length) return "";
+    const g=t[0].v-Math.max(...r.open.map(x=>x.v));
     return g>=25 ? "Your strategy is expensive here: "+t[0].n+" ("+t[0].p+") is worth "+
       g.toFixed(0)+" more points, but "+t[0].note : "";
   })();
@@ -520,27 +540,35 @@ function render(){
     (warn?'<div class="warn">'+esc(warn)+'</div>':'')+
     (live?'<div class="turn">YOUR PICK &mdash; click a player to draft him</div>'
         :'<div class="wait">'+esc(onClock)+' is picking&hellip;</div>')+
-    '<div class="grid2"><div><h2>Take one of these</h2>'+
-      '<div class="recs">'+r.ok.map((x,i)=>
-        '<div class="rec c'+x.p+(i===0?' top':'')+'"'+
-        (live?' data-act="take" data-arg="'+esc(x.i)+'"':'')+'>'+
-        '<span class="ps">'+x.p+'</span>'+
-        '<span class="nm">'+esc(x.n)+'</span>'+
-        '<div class="mets">'+
-          '<span>VOR <b>'+x.v.toFixed(0)+'</b></span>'+
-          '<span>'+(x.cost>0?'costs <b>'+x.cost.toFixed(0)+'</b>'
-                            :'<b>best available</b>')+'</span>'+
-          '<span>board <b>#'+x.r+'</b></span>'+
-          '<span><b>'+x.surv+'%</b> still there</span>'+
-        '</div></div>').join('')+'</div>'+
-      r.no.map(x=>'<div class="blocked">'+esc(x.n)+' ('+x.p+') &mdash; '+esc(x.note)+'</div>').join('')+
-      '<p style="margin-top:12px"><button data-act="auto">Take the top one for me</button> '+
-      '<button data-act="reset">Start over</button></p></div>'+
-    '<div>'+rosterPanel()+'<h2>Recent picks</h2>'+
-      S.picks.slice(-8).reverse().map(p=>'<div class="blocked">'+p.pick+'. '+
+    '<h2>Take one of these</h2>'+
+    '<p class="note" style="margin:0 0 10px">The best '+PER_POS+' left at every '+
+      'position'+(live?' &mdash; click any of them to draft him':'')+'. '+
+      (r.top?'Highest value on the board right now: <b>'+esc(r.top.n)+'</b> ('+
+        r.top.p+', VOR '+r.top.v.toFixed(0)+').':'')+'</p>'+
+    '<div class="board6">'+POS.map(pos=>{
+      const list=r.byPos[pos]||[];
+      if(!list.length) return '';
+      const blk=list[0].ok?'':list[0].note;
+      return '<div class="poscol"><h3 class="c'+pos+'">'+pos+
+        (blk?' <span class="blk">'+esc(blk)+'</span>':'')+'</h3>'+
+        list.map(x=>'<div class="rec c'+pos+(x.ok?'':' off')+
+          (r.top&&x.i===r.top.i?' top':'')+'"'+
+          (live?' data-act="take" data-arg="'+esc(x.i)+'"':'')+'>'+
+          '<span class="nm">'+esc(x.n)+'</span>'+
+          '<div class="mets">'+
+            '<span>VOR <b>'+x.v.toFixed(0)+'</b></span>'+
+            '<span>#'+x.r+'</span>'+
+            '<span>'+(x.cost>0?'-<b>'+x.cost.toFixed(0)+'</b>':'<b>best</b>')+'</span>'+
+            '<span><b>'+x.surv+'%</b> back</span>'+
+          '</div></div>').join('')+'</div>';
+    }).join('')+'</div>'+
+    '<p style="margin:0 0 6px"><button data-act="auto">Take the best one for me</button> '+
+    '<button data-act="reset">Start over</button></p>'+
+    '<div class="grid2"><div>'+rosterPanel()+'</div>'+
+    '<div><h2>Recent picks</h2>'+
+      S.picks.slice(-10).reverse().map(p=>'<div class="blocked">'+p.pick+'. '+
         esc(p.mgr)+' &mdash; '+esc(p.n)+' ('+p.p+')</div>').join('')+
     '</div></div>'+
-    legend()+
     '<h2>Every available player</h2>'+
     '<p class="note" style="margin:0 0 8px">Search by name or scroll a position '+
       'column. Anything here can be drafted &mdash; you are never limited to the '+
@@ -548,7 +576,8 @@ function render(){
     '<input id="q" type="search" autocomplete="off" '+
       'placeholder="Type a player name..." value="'+esc(query)+'">'+
     '<div id="pool" style="margin-top:10px">'+poolHTML(live)+'</div>'+
-    '<h2>Draft board</h2>'+boardHTML();
+    '<h2>Draft board</h2>'+boardHTML()+
+    legend();
 }
 
 let pick_me=null, pick_slot=null, pick_preset="value";
