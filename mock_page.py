@@ -104,17 +104,17 @@ PAGE = r"""<title>Mock draft room</title>
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;
  --ink-2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
  --hairline:rgba(11,11,11,0.10);--accent:#2a78d6;--neg:#e34948;--good:#006300;
- --cQB:#2a78d6;--cRB:#eb6834;--cWR:#1baf7a;--cTE:#eda100;--cK:#e87ba4;--cDEF:#008300}
+ --cQB:#4a3aa7;--cRB:#eb6834;--cWR:#1baf7a;--cTE:#eda100;--cK:#e87ba4;--cDEF:#008300}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
  --page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
  --grid:#2c2c2a;--axis:#383835;--hairline:rgba(255,255,255,0.10);
  --accent:#3987e5;--neg:#e66767;--good:#0ca30c;
- --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}}
+ --cQB:#9085e9;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}}
 :root[data-theme="dark"]{color-scheme:dark;
  --page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink-2:#c3c2b7;--muted:#898781;
  --grid:#2c2c2a;--axis:#383835;--hairline:rgba(255,255,255,0.10);
  --accent:#3987e5;--neg:#e66767;--good:#0ca30c;
- --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
+ --cQB:#9085e9;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
 *{box-sizing:border-box}
 body{margin:0;padding:28px 18px 70px;background:var(--page);color:var(--ink);
  font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -157,12 +157,22 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .poscol h3.cK{border-left-color:var(--cK)}.poscol h3.cDEF{border-left-color:var(--cDEF)}
 .poscol h3 .blk{text-transform:none;letter-spacing:0;font-weight:400;
  color:var(--neg);font-size:11px}
+/* The whole tile carries the position, not just an edge. A low-percentage tint
+   of the position hue keeps body text at full contrast in both themes, which a
+   saturated fill would not. */
 .rec{display:block;padding:8px 10px;border-radius:8px;background:var(--surface);
  border:1px solid var(--hairline);border-left:3px solid var(--muted);margin-bottom:6px}
-.rec.top{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
-.rec.off{opacity:.5}
+.rec.cQB{background:color-mix(in srgb,var(--cQB) 15%,var(--surface));border-left-color:var(--cQB)}
+.rec.cRB{background:color-mix(in srgb,var(--cRB) 15%,var(--surface));border-left-color:var(--cRB)}
+.rec.cWR{background:color-mix(in srgb,var(--cWR) 15%,var(--surface));border-left-color:var(--cWR)}
+.rec.cTE{background:color-mix(in srgb,var(--cTE) 15%,var(--surface));border-left-color:var(--cTE)}
+.rec.cK{background:color-mix(in srgb,var(--cK) 15%,var(--surface));border-left-color:var(--cK)}
+.rec.cDEF{background:color-mix(in srgb,var(--cDEF) 15%,var(--surface));border-left-color:var(--cDEF)}
+/* Blue is never a position -- it only ever means "the tool is pointing here". */
+.rec.top{box-shadow:inset 0 0 0 2px var(--accent);border-color:var(--accent)}
+.rec.off{opacity:.45}
 .live .rec{cursor:pointer}
-.live .rec:hover{opacity:1;background:var(--page);border-color:var(--accent)}
+.live .rec:hover{opacity:1;filter:brightness(1.06);border-color:var(--accent)}
 .rec .nm{display:block;font-weight:600;font-size:13.5px;line-height:1.25;
  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rec .mets{display:grid;grid-template-columns:1fr auto;gap:1px 8px;margin-top:5px;
@@ -184,7 +194,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
 /* Per-manager skin. Applied by adding a class to <body>, so it only has to
    override the accent token and a couple of surfaces. */
-body.skin-wburnett7{--accent:#00915c;--cWR:#00915c}
+body.skin-wburnett7{--accent:#00915c}
 body.skin-wburnett7 .turn{background:#00915c}
 body.skin-wburnett7 h1{color:#00915c;letter-spacing:-.01em}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]) body.skin-wburnett7{
@@ -486,8 +496,23 @@ function legend(){
     '<tr><td><b>Red banner</b></td><td>Appears when your strategy is blocking someone '+
       'clearly better than anything it allows. Not an instruction &mdash; just the cost, '+
       'so you can break your own rule knowingly.</td></tr>'+
-    '<tr><td><b>Colours</b></td><td>'+POS.map(p=>'<span class="c'+p+' pill">'+p+
-      '</span>').join(' ')+' &mdash; position is always written out too, never colour alone.</td></tr>'+
+    '<tr><td><b>Tile colour</b></td><td>Every tile is tinted by the player\'s '+
+      'position: '+POS.map(p=>'<span class="c'+p+' pill">'+p+'</span>').join(' ')+
+      '. It is only ever a label &mdash; a green tile is not better than an '+
+      'orange one. The position is written in the column heading too, so you '+
+      'never have to rely on colour.</td></tr>'+
+    '<tr><td><b>Blue</b></td><td><b>Blue is never a position.</b> It means the '+
+      'tool is pointing at something. A blue ring round a tile marks the '+
+      'highest-value player left on the whole board; the blue bar across the '+
+      'top means it is your turn; blue text is a live control. Quarterbacks '+
+      'are purple, so nothing competes with it.</td></tr>'+
+    '<tr><td><b>Faded tiles</b></td><td>A whole column fades when your chosen '+
+      'strategy blocks that position, with the reason beside the heading (for '+
+      'example "not before round 8"). They stay clickable on purpose &mdash; '+
+      'the rule is there to show you a cost, not to stop you.</td></tr>'+
+    '<tr><td><b>Red</b></td><td>Reserved for warnings: the banner when your '+
+      'strategy is blocking someone clearly better, and the reason text on a '+
+      'blocked column.</td></tr>'+
     '</table></details>';
 }
 function summary(){
