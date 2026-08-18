@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 TARGETS = [ROOT / "report.html", ROOT / "out" / "shared.html",
-           ROOT / "draft-report.html", ROOT / "out" / "draft-shared.html"]
+           ROOT / "draft-report.html", ROOT / "out" / "draft-shared.html",
+           ROOT / "dashboard.html", ROOT / "out" / "dashboard.html"]
 CHAR_W = 6.6  # conservative average advance for 12px system-ui
 
 if hasattr(sys.stdout, "reconfigure"):
