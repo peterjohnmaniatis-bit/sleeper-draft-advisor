@@ -35,6 +35,10 @@ import strategies as strat_mod
 from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
 ROOT = Path(__file__).resolve().parent
+# Completed drafts the scorecard can replay, newest first.
+PAST_SEASONS = [x["season"] for x in reversed(
+    (_load("index.json") or {}).get("seasons", []))
+    if (ROOT / "data" / "raw" / x["season"]).exists()][1:]
 API = "https://api.sleeper.app/v1"
 
 # Filled in from the league's own roster settings at startup. The advisor needs
@@ -447,10 +451,20 @@ class DraftState:
                 return pk
         return None
 
-    def roast(self):
+    def roast(self, season=None):
         """The live scorecard. Isolated from advice() on purpose: this is a
         separate page and a bug in the comedy must not be able to take the
         draft board down with it."""
+        # A past season is graded from the cache, not from tonight's feed.
+        if season and str(season) != str(self.season):
+            picks = scorecard_mod.past_picks(season)
+            rows, standings = scorecard_mod.scorecard(picks, str(season))
+            # The season list rides on every response, not just the live one:
+            # a link straight to a past year would otherwise render with no way
+            # back to tonight.
+            return {"season": str(season), "picks": len(picks), "live": False,
+                    "rows": rows, "standings": standings, "order_known": True,
+                    "seasons": PAST_SEASONS}
         uid_by_name = {n: u for u, n in (self.users or {}).items()}
         picks = [{"pick_no": p["pick_no"], "round": p["round"],
                   "manager": p["manager"], "player_id": p["player_id"],
@@ -458,9 +472,9 @@ class DraftState:
                   "user_id": uid_by_name.get(p["manager"], "")}
                  for p in self.picks]
         rows, standings = scorecard_mod.scorecard(picks, self.season)
-        return {"season": self.season, "picks": len(self.picks),
+        return {"season": self.season, "picks": len(self.picks), "live": True,
                 "rows": rows, "standings": standings,
-                "order_known": self.order_known}
+                "order_known": self.order_known, "seasons": PAST_SEASONS}
 
     def seat_of(self, name):
         """Slot number for a manager, or None. Used to give each viewer of a
@@ -775,9 +789,19 @@ ROAST_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .tbl td.n,.tbl th.n{text-align:right}
 .tbl tr:first-child td{font-weight:650}
 .empty{color:var(--muted);margin-top:14px}
+.seasons{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:12px 0 0}
+.seasons .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);margin-right:4px}
+.seasons button{font:inherit;font-size:13px;padding:4px 12px;border-radius:999px;
+  border:1px solid var(--hairline);background:var(--surface);color:var(--ink-2);
+  cursor:pointer}
+.seasons button:hover{border-color:var(--accent)}
+.seasons button.sel{background:var(--accent);border-color:var(--accent);
+  color:#fff;font-weight:600}
 </style></head><body>
 <div class="wrap">
 <h1>Draft scorecard</h1><p class="sub" id="sub">waiting for the first pick...</p>
+<div class="seasons" id="seasons"></div>
 <div id="main"></div>
 <p class="note" style="margin-top:34px">Grades measure how far ahead of the
 market a pick was, in standard deviations fitted on 900 real picks from this
@@ -819,16 +843,49 @@ function table(st){
     }).join('')+'</table>';
 }
 
+/* Which draft is on screen. Empty means tonight's. Kept in the URL so a link
+   to a specific year's carnage can be sent on its own. */
+var YEAR = (new URLSearchParams(location.search)).get('season') || '';
+var SEASONS = [];
+function setYear(v){
+  YEAR = v;
+  var u = new URL(location);
+  if(v) u.searchParams.set('season', v); else u.searchParams.delete('season');
+  history.replaceState(null, '', u);
+  tick();
+}
+function seasonBar(s){
+  if(s.seasons && s.seasons.length) SEASONS = s.seasons;
+  if(!SEASONS.length) return '';
+  return '<span class="lbl">Draft</span>'+
+    /* data-y rather than an inline string argument: this template lives inside
+       a Python string, and an escaped quote collapses to a bare one before it
+       ever reaches the browser -- which is exactly how this broke first time. */
+    '<button data-y="" onclick="setYear(this.dataset.y)"'+
+      (YEAR?'':' class="sel"')+'>Tonight</button>'+
+    SEASONS.map(function(y){
+      return '<button data-y="'+esc(y)+'" onclick="setYear(this.dataset.y)"'+
+        (YEAR===y?' class="sel"':'')+'>'+esc(y)+'</button>';
+    }).join('');
+}
+
 async function tick(){
   let s;
-  try{ s = await (await fetch('/api/scorecard')).json(); }catch(e){ return; }
+  const q = YEAR ? '?season='+encodeURIComponent(YEAR) : '';
+  try{ s = await (await fetch('/api/scorecard'+q)).json(); }catch(e){ return; }
   const sub = document.getElementById('sub');
   if(s.error){ sub.textContent = 'scorecard error: '+s.error; return; }
-  sub.textContent = s.picks+' picks in, '+s.rows.length+' of them graded';
+  document.getElementById('seasons').innerHTML = seasonBar(s);
+  sub.textContent = s.live
+    ? (s.picks ? s.picks+' picks in, '+s.rows.length+' graded'
+               : 'Tonight has not started. Pick a past year below and enjoy the receipts.')
+    : s.season+' draft — '+s.picks+' picks, '+s.rows.length+' graded, '+
+      'judged only on what was known at the time';
   document.getElementById('main').innerHTML = table(s.standings)+
-    '<h2>Every pick, most recent first</h2>'+feed(s.rows);
+    (s.rows.length ? '<h2>Every pick, most recent first</h2>'+feed(s.rows) : '');
 }
-tick(); setInterval(tick, 3000);
+/* A finished draft never changes, so only poll when watching tonight's. */
+tick(); setInterval(function(){ if(!YEAR) tick(); }, 3000);
 </script></body></html>
 """
 
@@ -1314,9 +1371,11 @@ def serve(state, host, port, open_browser=True, share=False,
 
         def do_GET(self):
             if self.path.startswith("/api/scorecard"):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                yr = (q.get("season") or [""])[0]
                 try:
                     with state.lock:
-                        body = json.dumps(state.roast()).encode("utf-8")
+                        body = json.dumps(state.roast(yr or None)).encode("utf-8")
                 except Exception as err:            # noqa: BLE001
                     # The scorecard is entertainment; the draft board is not.
                     # It fails to an error payload rather than a 500 so a bad

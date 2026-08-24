@@ -56,11 +56,54 @@ def round_weight(rnd):
     return 0.4
 
 
-def load_grudges():
+def load_grudges(before=None):
+    """Receipts, optionally limited to seasons before the one being graded.
+
+    Grading a past draft with receipts drawn from that same season -- or from
+    later ones -- would quote flops that had not happened yet on the night.
+    """
     p = ROOT / "data" / "grudges.json"
     if not p.exists():
         return {"league_mean_over": 4.0, "managers": {}}
-    return json.loads(p.read_text(encoding="utf-8"))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not before:
+        return data
+    cut = str(before)
+    out = {"league_mean_over": data.get("league_mean_over", 4.0), "managers": {}}
+    for uid, m in (data.get("managers") or {}).items():
+        overs = [o for yr, lst in (m.get("overs_by_season") or {}).items()
+                 if yr < cut for o in lst]
+        out["managers"][uid] = {
+            **m,
+            "mean_over": round(statistics.fmean(overs), 1) if overs else None,
+            "damning": [d for d in m.get("damning", []) if d["season"] < cut],
+            "busts": [b for b in m.get("busts", []) if b["season"] < cut],
+            "early_qb": [q for q in m.get("early_qb", []) if q["season"] < cut],
+            "worst_reaches": [r for r in m.get("worst_reaches", [])
+                              if r["season"] < cut],
+        }
+    return out
+
+
+def past_picks(season):
+    """A completed draft, in the same shape the live feed produces."""
+    import glob
+    from model import RAW
+    analysis = json.loads((ROOT / "data" / "analysis.json").read_text(encoding="utf-8"))
+    yr = next((s for s in analysis["seasons"] if s["season"] == str(season)), None)
+    if not yr:
+        return []
+    files = sorted(glob.glob(str(RAW / str(season) / "draft_*_picks.json")))
+    ids = {}
+    if files:
+        for p in json.loads(Path(files[0]).read_text(encoding="utf-8")):
+            if p.get("pick_no"):
+                ids[p["pick_no"]] = str(p.get("player_id") or "")
+    return [{"pick_no": d["pick_no"], "round": d.get("round"),
+             "manager": d.get("manager"), "player": d.get("player"),
+             "pos": d.get("position"), "user_id": str(d.get("user_id") or ""),
+             "player_id": ids.get(d["pick_no"], "")}
+            for d in yr["draft"]]
 
 
 def grade_for(sd_over):
@@ -205,7 +248,7 @@ def repeat_context(pick, hist, sd_over, seen_counts):
 def scorecard(picks, season, grudges=None):
     """Grade a whole draft so far. Returns (rows, standings)."""
     market = adp_mod.load(season)
-    grudges = grudges or load_grudges()
+    grudges = grudges if grudges is not None else load_grudges(before=season)
     rows, seen = [], {}
     for p in picks:
         r = score_pick(p, market, grudges, seen)

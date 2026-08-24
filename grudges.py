@@ -104,8 +104,15 @@ def build():
                 s = r["season"]
                 if s not in first_qb or r["round"] < first_qb[s]:
                     first_qb[s] = r["round"]
+        # Kept per season so a historical scorecard can rebuild the average
+        # from only the seasons that had already happened. Grading the 2025
+        # draft while quoting a 2025 flop is a time-travelling insult.
+        by_season = defaultdict(list)
+        for r in m["reaches"]:
+            by_season[r["season"]].append(r["over"])
         out["managers"][uid] = {
             "name": m["name"],
+            "overs_by_season": {k: v for k, v in by_season.items()},
             "aka": sorted(x for x in m["aka"] if x != m["name"]),
             "seasons": sorted(m["seasons"]),
             "picks": m["picks"],
