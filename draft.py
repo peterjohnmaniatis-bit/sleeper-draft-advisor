@@ -36,6 +36,7 @@ from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
 ROOT = Path(__file__).resolve().parent
 # Completed drafts the scorecard can replay, newest first.
+WORST_N = 10          # a past year shows only its ten ugliest picks
 PAST_SEASONS = [x["season"] for x in reversed(
     (_load("index.json") or {}).get("seasons", []))
     if (ROOT / "data" / "raw" / x["season"]).exists()][1:]
@@ -458,22 +459,24 @@ class DraftState:
         # A past season is graded from the cache, not from tonight's feed.
         if season and str(season) != str(self.season):
             picks = scorecard_mod.past_picks(season)
-            rows, standings = scorecard_mod.scorecard(picks, str(season))
+            rows, standings, best = scorecard_mod.scorecard(
+                picks, str(season), worst=WORST_N, best=WORST_N)
             # The season list rides on every response, not just the live one:
             # a link straight to a past year would otherwise render with no way
             # back to tonight.
             return {"season": str(season), "picks": len(picks), "live": False,
-                    "rows": rows, "standings": standings, "order_known": True,
-                    "seasons": PAST_SEASONS}
+                    "rows": rows, "best": best, "standings": standings,
+                    "order_known": True, "seasons": PAST_SEASONS,
+                    "worst": WORST_N}
         uid_by_name = {n: u for u, n in (self.users or {}).items()}
         picks = [{"pick_no": p["pick_no"], "round": p["round"],
                   "manager": p["manager"], "player_id": p["player_id"],
                   "player": p.get("name"), "pos": p.get("pos"),
                   "user_id": uid_by_name.get(p["manager"], "")}
                  for p in self.picks]
-        rows, standings = scorecard_mod.scorecard(picks, self.season)
+        rows, standings, _ = scorecard_mod.scorecard(picks, self.season)
         return {"season": self.season, "picks": len(self.picks), "live": True,
-                "rows": rows, "standings": standings,
+                "rows": rows, "best": [], "standings": standings,
                 "order_known": self.order_known, "seasons": PAST_SEASONS}
 
     def seat_of(self, name):
@@ -762,7 +765,10 @@ def poll_live(state, interval=3.0):
 # them as format specifiers and raises TypeError.
 ROAST_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Draft scorecard</title><style>/*__CSS__*/
+<title>Jalen Hurts is a Running Back</title><style>/*__CSS__*/
+.hero{margin:0 0 6px}
+.hero img{max-width:100%;max-height:420px;border-radius:12px;
+  border:1px solid var(--hairline);display:block}
 .wrap{max-width:1040px}
 .gr{display:inline-flex;align-items:center;justify-content:center;width:30px;
   height:30px;border-radius:8px;font-weight:700;font-size:15px;color:#fff;
@@ -800,7 +806,11 @@ ROAST_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   color:#fff;font-weight:600}
 </style></head><body>
 <div class="wrap">
-<h1>Draft scorecard</h1><p class="sub" id="sub">waiting for the first pick...</p>
+<div class="hero">/*__HERO__*/</div>
+<h1>Jalen Hurts is a Running Back</h1>
+<p class="sub" id="sub">waiting for the first pick...</p>
+<p class="note" style="margin:2px 0 0">Every pick of this league, graded as it
+lands. Nobody asked for this.</p>
 <div class="seasons" id="seasons"></div>
 <div id="main"></div>
 <p class="note" style="margin-top:34px">Grades measure how far ahead of the
@@ -808,16 +818,19 @@ market a pick was, in standard deviations fitted on 900 real picks from this
 league's own drafts. Kickers and defences are not graded &mdash; their ADP is
 noise and reaching there costs nothing. Late rounds are damped, because twelve
 picks early in round two burns a starter and twelve picks early in round
-thirteen burns nobody. Receipts come from five seasons of this league.</p>
+thirteen burns nobody. Receipts come from five seasons of this league, and a past draft is
+judged only on what had already happened by then. Past years show their ten
+ugliest picks; the standings above them are computed over the whole draft.
+No line is ever used twice.</p>
 </div>
 <script>
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-function feed(rows){
+function feed(rows, newestFirst){
   if(!rows.length) return '<p class="empty">No graded picks yet. Kickers and '+
     'defences do not count, and neither does anyone the market has no opinion '+
     'about.</p>';
-  return '<div class="feed">'+rows.slice().reverse().map(function(r){
+  return '<div class="feed">'+(newestFirst ? rows.slice().reverse() : rows).map(function(r){
     return '<div class="ev'+(r.repeat?' rep':'')+'">'+
       '<span class="gr '+r.grade+'">'+r.grade+'</span>'+
       '<div class="bd"><div class="hd">R'+r.round+' pick '+r.pick_no+' &middot; '+
@@ -879,10 +892,19 @@ async function tick(){
   sub.textContent = s.live
     ? (s.picks ? s.picks+' picks in, '+s.rows.length+' graded'
                : 'Tonight has not started. Pick a past year below and enjoy the receipts.')
-    : s.season+' draft — '+s.picks+' picks, '+s.rows.length+' graded, '+
-      'judged only on what was known at the time';
+    : s.season+' draft — the '+s.rows.length+' worst picks of '+s.picks+
+      ', judged only on what was known at the time';
   document.getElementById('main').innerHTML = table(s.standings)+
-    (s.rows.length ? '<h2>Every pick, most recent first</h2>'+feed(s.rows) : '');
+    (s.rows.length
+      ? '<h2>'+(s.live ? 'Every pick, most recent first'
+                       : 'The '+s.rows.length+' worst picks of that draft')+'</h2>'+
+        feed(s.rows, s.live)
+      : '')+
+    ((s.best && s.best.length)
+      ? '<h2>The '+s.best.length+' best picks of that draft</h2>'+
+        '<p class="note" style="margin:0 0 4px">The ones taken furthest after '+
+        'the market had them. Grudgingly acknowledged.</p>'+feed(s.best)
+      : '');
 }
 /* A finished draft never changes, so only poll when watching tonight's. */
 tick(); setInterval(function(){ if(!YEAR) tick(); }, 3000);
@@ -1050,8 +1072,8 @@ button.primary:disabled{opacity:.45;cursor:not-allowed}
 </style></head><body><div class="wrap">
 <h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p>
 <p class="note" style="margin:2px 0 0"><a href="/roast" target="_blank"
- style="color:var(--accent)">Open the draft scorecard</a> &mdash; every pick
- graded as it lands. It is not kind.</p><div id="seatbar"></div><div id="offline" class="offline"></div>
+ style="color:var(--accent)">Jalen Hurts is a Running Back</a> &mdash; every
+ pick graded as it lands. It is not kind.</p><div id="seatbar"></div><div id="offline" class="offline"></div>
 <div id="main"></div></div>
 <script>
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1353,7 +1375,20 @@ def serve(state, host, port, open_browser=True, share=False,
     from report import CSS
     cards = [{k: st[k] for k in ("key", "label", "grade", "one", "detail",
                                  "verdict")} for st in strat_mod.STRATEGIES]
-    roast_page = ROAST_PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
+    # The header art is inlined rather than served as a file: this page has no
+    # static route and one self-contained document is one less thing to break
+    # on draft night.
+    hero = ""
+    art = ROOT / "assets" / "hero-scorecard.png"
+    if art.exists():
+        import base64
+        blob = base64.b64encode(art.read_bytes()).decode("ascii")
+        hero = (f'<img src="data:image/png;base64,{blob}" '
+                f'alt="Jalen Hurts, allegedly">')
+        print(f"  scorecard header: embedded {art.name} "
+              f"({art.stat().st_size / 1024:.0f} KB)")
+    roast_page = (ROAST_PAGE.replace("/*__CSS__*/", CSS)
+                            .replace("/*__HERO__*/", hero).encode("utf-8"))
     page = (PAGE.replace("/*__CSS__*/", CSS)
                 .replace("/*__STRATEGIES__*/", json.dumps(cards))
                 .encode("utf-8"))

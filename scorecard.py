@@ -194,9 +194,11 @@ def score_pick(pick, market, grudges, seen_counts):
         "pick_no": pick["pick_no"], "round": pick.get("round"),
         "manager": ctx["mgr"], "player": ctx["player"], "pos": ctx["pos"],
         "adp": round(a, 1), "over": round(over, 1), "sd_over": round(sd_over, 2),
-        "grade": g,
-        "line": pick_line(cat, ctx, pick["pick_no"], skip_tokens(ctx)),
-        "repeat": bool(repeat),
+        "grade": g, "repeat": bool(repeat),
+        # Carried so the caller can render the sentence AFTER deciding which
+        # picks make the page. Rendering here would spend the good lines on
+        # picks a historical view never shows.
+        "_cat": cat, "_ctx": ctx,
     }
 
 
@@ -225,8 +227,12 @@ def repeat_context(pick, hist, sd_over, seen_counts):
     pos, rnd = pick.get("pos"), pick.get("round") or 99
     uid = str(pick.get("user_id") or "")
 
-    # Early quarterback, in a league where that is the identified mistake.
-    if pos == "QB" and rnd <= 4 and hist.get("early_qb"):
+    # Early quarterback, in a league where that is the identified mistake --
+    # but only when he actually paid up for it. The repeat copy is written for
+    # reaches, so firing it on a quarterback taken at genuine value captions a
+    # good pick "the 3rd QB reach of the era", which is simply false.
+    if (pos == "QB" and rnd <= 4 and hist.get("early_qb")
+            and sd_over > -VALUE_SD):
         yrs = [q["season"] for q in hist["early_qb"]]
         if yrs:
             return {"qb_yrs": ", ".join(yrs), "n": len(yrs) + 1}
@@ -245,8 +251,16 @@ def repeat_context(pick, hist, sd_over, seen_counts):
     return None
 
 
-def scorecard(picks, season, grudges=None):
-    """Grade a whole draft so far. Returns (rows, standings)."""
+def scorecard(picks, season, grudges=None, worst=None, best=None):
+    """Grade a draft. Returns (rows, standings).
+
+    `worst` and `best` keep only the N ugliest and N sharpest picks. Standings
+    are still computed over EVERY pick -- a GPA built from a manager's ten worst
+    moments would say nothing about how he actually drafted.
+
+    Returns (worst_rows, standings, best_rows). best_rows is empty unless asked
+    for, so the live feed keeps its single chronological list.
+    """
     market = adp_mod.load(season)
     grudges = grudges if grudges is not None else load_grudges(before=season)
     rows, seen = [], {}
@@ -274,4 +288,28 @@ def scorecard(picks, season, grudges=None):
             "worst": m["worst"],
         })
     standings.sort(key=lambda x: (x["gpa"], -x["mean_over"]))
-    return rows, standings
+
+    shown, top = rows, []
+    if worst:
+        shown = sorted(rows, key=lambda r: -r["sd_over"])[:worst]
+        shown.sort(key=lambda r: r["pick_no"])
+    if best:
+        # The sharpest picks are the ones taken furthest AFTER the market had
+        # them. Anything already in the worst list is excluded, which cannot
+        # normally happen but would look ridiculous if it ever did.
+        ids = {r["pick_no"] for r in shown} if worst else set()
+        top = sorted((r for r in rows if r["pick_no"] not in ids),
+                     key=lambda r: r["sd_over"])[:best]
+        top.sort(key=lambda r: r["pick_no"])
+    # Lines are rendered last, over only what the page will show, and both
+    # lists share one counter so a best pick and a worst pick can never end up
+    # wearing the same sentence.
+    used = {}
+    for r in shown + top:
+        r["line"] = pick_line(r.pop("_cat"), r["_ctx"], r["pick_no"],
+                              skip_tokens(r["_ctx"]), used)
+        r.pop("_ctx", None)
+    for r in rows:
+        r.pop("_cat", None)
+        r.pop("_ctx", None)
+    return shown, standings, top
