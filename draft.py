@@ -15,13 +15,18 @@ import json
 import math
 import random
 import sys
+import atexit
+import re
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import defaultdict
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from model import RAW, Players, Season, _load, replacement_ranks
@@ -147,20 +152,31 @@ def roster_counts(roster, board_by_id):
     return counts
 
 
-def directive_check(pos, rnd, counts):
+# A seat that is not mine gets no directive at all: plain best-available.
+# Two reasons. It is more honest advice for them -- my plan is built around my
+# roster and this league's read on me -- and it keeps a shared link from
+# broadcasting my strategy and my positional blocks to eleven opponents.
+OPEN_DIRECTIVE = {"label": "Best available", "earliest_round": {},
+                  "max_by_round": {}, "want_by_round": {},
+                  "roster_caps": {"QB": 3, "K": 2, "DEF": 2, "TE": 3,
+                                  "RB": 8, "WR": 9}}
+
+
+def directive_check(pos, rnd, counts, directive=None):
     """Why the directive would or would not allow this pick.
 
     Returns (allowed, note, kind). `kind` separates a timing rule you might
     reasonably override ("no QB before round 8") from a roster fact you cannot
     ("already have 2 TE") -- only the former is worth arguing with.
     """
-    earliest = DIRECTIVE["earliest_round"].get(pos)
+    d = directive or DIRECTIVE
+    earliest = d["earliest_round"].get(pos)
     if earliest and rnd < earliest:
         return False, f"directive: no {pos} before round {earliest}", "timing"
-    cap = DIRECTIVE["roster_caps"].get(pos)
+    cap = d["roster_caps"].get(pos)
     if cap is not None and counts.get(pos, 0) >= cap:
         return False, f"already have {counts[pos]} {pos}", "cap"
-    for (p, through), limit in DIRECTIVE["max_by_round"].items():
+    for (p, through), limit in d["max_by_round"].items():
         if p == pos and rnd <= through and counts.get(pos, 0) >= limit:
             return False, f"directive: max {limit} {pos} through round {through}", "timing"
     return True, "", ""
@@ -212,7 +228,7 @@ def survival_for(p, queue_rank, picks_until_next, league_norm, rnd, next_pick):
 
 
 def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
-              limit=6):
+              limit=6, directive=None):
     """Rank the available players for this pick."""
     by_id = {p["player_id"]: p for p in board}
     counts = roster_counts(roster, by_id)
@@ -222,7 +238,7 @@ def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
         if p["player_id"] in taken:
             continue
         queue[p["pos"]] += 1
-        ok, note, kind = directive_check(p["pos"], rnd, counts)
+        ok, note, kind = directive_check(p["pos"], rnd, counts, directive)
         surv, surv_src = survival_for(p, queue[p["pos"]], picks_until_next,
                                       league_norm, rnd, pick_no + picks_until_next)
         # Value you would lose by waiting. Clamped at zero because the term is
@@ -394,11 +410,22 @@ class DraftState:
         idx = (pick_no - 1) % self.teams
         return (idx + 1) if rnd % 2 == 1 else (self.teams - idx), rnd
 
-    def my_next_pick(self, after):
+    def my_next_pick(self, after, seat=None):
+        seat = seat or self.slot
         for pk in range(after, self.teams * self.rounds + 1):
             s, _ = self.slot_on_clock(pk)
-            if s == self.slot:
+            if s == seat:
                 return pk
+        return None
+
+    def seat_of(self, name):
+        """Slot number for a manager, or None. Used to give each viewer of a
+        shared link the recommendations for THEIR seat rather than mine."""
+        if not name:
+            return None
+        for i, n in enumerate(self.order, 1):
+            if n == name:
+                return i
         return None
 
     @property
@@ -417,17 +444,29 @@ class DraftState:
         self.rosters[manager].append(player_id)
 
     # -- advice ---------------------------------------------------------
-    def advice(self):
+    def advice(self, seat=None):
+        """Advice from ONE seat's point of view.
+
+        Defaults to my own seat. A shared link passes ?me=<manager> so each
+        league member watching sees their own turn timer, their own roster and
+        their own picks-until-next -- which drives the whole ranking, so
+        serving everyone my seat would give eleven people confidently wrong
+        numbers.
+        """
+        seat = seat or self.slot
         pk = self.current_pick
         if pk > self.teams * self.rounds:
             return {"done": True}
         slot, rnd = self.slot_on_clock(pk)
         on_clock = self.order[slot - 1] if len(self.order) >= slot else f"slot {slot}"
-        nxt = self.my_next_pick(pk + 1)
+        nxt = self.my_next_pick(pk + 1, seat)
         gap = (nxt - pk) if nxt else 0
-        mine = self.rosters[self.my_name]
+        seat_name = (self.order[seat - 1] if len(self.order) >= seat
+                     else self.my_name)
+        mine = self.rosters[seat_name]
+        d = DIRECTIVE if seat == self.slot else OPEN_DIRECTIVE
         allowed, blocked = recommend(self.board, self.taken, mine, rnd, pk,
-                                     gap, self.league_norm)
+                                     gap, self.league_norm, directive=d)
         counts = roster_counts(mine, self.by_id)
         # What each option costs against the best thing on the board. This is
         # the number that curbs reaching: take row 4 and you see the price.
@@ -441,7 +480,9 @@ class DraftState:
         wait = wait_advice(allowed, nxt)
         return {
             "done": False, "pick_no": pk, "round": rnd, "slot": slot,
-            "on_clock": on_clock, "my_turn": slot == self.slot,
+            "on_clock": on_clock, "my_turn": slot == seat,
+            "seat": seat, "seat_name": seat_name,
+            "managers": list(self.order),
             "picks_until_next": gap,
             "recommend": allowed, "blocked": blocked,
             "warn": directive_cost(allowed, blocked),
@@ -450,7 +491,7 @@ class DraftState:
                                           "vor": 0}) for p in mine],
             "counts": dict(counts),
             "recent": list(reversed(self.picks[-8:])),
-            "directive": DIRECTIVE["label"],
+            "directive": d["label"],
             "order_known": self.order_known,
             "stale": round(time.time() - self.last_ok),
             "manual": self.manual,
@@ -611,6 +652,16 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .rec .nm{font-weight:600;flex:1}
 .rec .pos{font-size:12px;color:var(--muted);width:32px}
 .rec .num{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:13px}
+
+.seatbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 4px}
+.seatbar .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);margin-right:4px}
+.seatbar button{font:inherit;font-size:13px;padding:4px 10px;border-radius:999px;
+  border:1px solid var(--hairline);background:var(--surface);color:var(--ink-2);
+  cursor:pointer}
+.seatbar button:hover{border-color:var(--accent)}
+.seatbar button.sel{background:var(--accent);border-color:var(--accent);
+  color:#fff;font-weight:600}
 .wait-tip{background:var(--surface);border:1px solid var(--accent);
   color:var(--ink);padding:10px 14px;border-radius:8px;margin-bottom:8px;font-size:14px}
 .warn{background:var(--neg);color:#fff;padding:10px 14px;border-radius:8px;
@@ -664,7 +715,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .pick-on .av:hover{background:var(--surface)}
 .av .v{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
 </style></head><body><div class="wrap">
-<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p>
+<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p><div id="seatbar"></div>
 <div id="main"></div></div>
 <script>
 const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -703,8 +754,33 @@ function pool(s, live){
   }).join('')+'</div>';
 }
 
+/* Which seat this browser watches from. Kept in the URL so a link sent to a
+   league member carries their own seat, and in localStorage so a refresh
+   mid-draft does not dump them back onto somebody else's view. */
+var SEAT = (new URLSearchParams(location.search)).get('me')
+        || localStorage.getItem('ff_seat') || '';
+function setSeat(v){
+  SEAT = v; try{ localStorage.setItem('ff_seat', v); }catch(e){}
+  var u = new URL(location); u.searchParams.set('me', v);
+  history.replaceState(null, '', u); tick();
+}
+function seatBar(s){
+  if(!s.managers || !s.managers.length) return '';
+  return '<div class="seatbar"><span class="lbl">Watching as</span>'+
+    s.managers.map(function(m){
+      /* Read the name back off the dataset rather than interpolating it into
+         a JS string literal -- a manager display name is user-controlled and
+         an apostrophe would break out of the handler. */
+      return '<button data-seat="'+esc(m)+'" onclick="setSeat(this.dataset.seat)"'+
+        (m===s.seat_name?' class="sel"':'')+'>'+esc(m)+'</button>';
+    }).join('')+'</div>';
+}
+
 async function tick(){
-  let s; try{ s = await (await fetch('/api/state')).json(); }catch(e){ return; }
+  let s;
+  try{
+    s = await (await fetch('/api/state?me='+encodeURIComponent(SEAT))).json();
+  }catch(e){ return; }
   const sub = document.getElementById('sub');
   if(s.done){
     sub.textContent = 'Draft complete';
@@ -712,6 +788,8 @@ async function tick(){
     return;
   }
   sub.textContent = 'Round '+s.round+' \\u00b7 pick '+s.pick_no+' \\u00b7 '+s.directive;
+  var sb = document.getElementById('seatbar');
+  if(sb) sb.innerHTML = seatBar(s);
   const live = !!(s.manual && s.awaiting && s.my_turn);
   document.body.className = live ? 'pick-on' : '';
 
@@ -757,7 +835,55 @@ tick(); setInterval(tick, 1500);
 </script></body></html>"""
 
 
-def serve(state, host, port, open_browser=True):
+def start_tunnel(port):
+    """Public read-only link via cloudflared, for league members watching.
+
+    A quick tunnel, so the URL is random and disposable and nothing is
+    registered anywhere. Everything served is already public through Sleeper's
+    own unauthenticated API, and the write endpoint is refused outright outside
+    rehearsal -- but this is still the open internet reaching a port on this
+    machine, so it should be stopped when the draft ends.
+    """
+    exe = shutil.which("cloudflared") or shutil.which("cloudflared.exe")
+    if not exe:
+        print("  ! cloudflared not found -- serving locally only")
+        return
+    proc = subprocess.Popen(
+        [exe, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace", bufsize=1)
+
+    def watch():
+        # Keep draining stdout for the whole run, printing only the first URL.
+        # Stopping early is a deadlock: cloudflared blocks once the pipe buffer
+        # fills, and the tunnel silently stops forwarding while the local
+        # server carries on answering perfectly.
+        seen = False
+        for line in proc.stdout:
+            m = None if seen else re.search(
+                r"https://[-\w.]+\.trycloudflare\.com", line)
+            if m:
+                seen = True
+                # flush=True matters: this runs on a daemon thread and stdout
+                # is block-buffered whenever it is not a terminal, so the one
+                # line the user is waiting for would sit unseen in the buffer.
+                print("", flush=True)
+                print(f"  SHARE THIS: {m.group(0)}", flush=True)
+                print("  Anyone with the link can watch. It stops when you stop",
+                      flush=True)
+                print("  this program.", flush=True)
+                print("", flush=True)
+        # stdout closed: cloudflared exited. The local page keeps working, so
+        # without this the only symptom is league members quietly losing the
+        # link while everything looks fine on this machine.
+        print("\n  ! the public link has stopped. Local page is unaffected.",
+              flush=True)
+        print("    Restart with --share to get a new link.\n", flush=True)
+    threading.Thread(target=watch, daemon=True).start()
+    atexit.register(proc.terminate)
+
+
+def serve(state, host, port, open_browser=True, share=False):
     from report import CSS
     page = PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
 
@@ -774,8 +900,12 @@ def serve(state, host, port, open_browser=True):
 
         def do_GET(self):
             if self.path.startswith("/api/state"):
+                q = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                who = (q.get("me") or [""])[0]
                 with state.lock:
-                    body = json.dumps(state.advice()).encode("utf-8")
+                    seat = state.seat_of(who)
+                    body = json.dumps(state.advice(seat)).encode("utf-8")
                 self._send(200, body, "application/json")
             else:
                 self._send(200, page, "text/html; charset=utf-8")
@@ -783,7 +913,11 @@ def serve(state, host, port, open_browser=True):
         def do_POST(self):
             """Your pick, in rehearsal mode. Rejected unless the simulation is
             actually waiting on you and the player is genuinely available."""
-            if not self.path.startswith("/api/pick"):
+            # Rehearsal only. `awaiting` is never true in a live draft, so this
+            # was already inert -- but the link is now shareable, and a public
+            # endpoint that mutates draft state should be refused outright
+            # rather than left to a state flag several call frames away.
+            if not state.manual or not self.path.startswith("/api/pick"):
                 self._send(404, b'{"ok":false}', "application/json")
                 return
             try:
@@ -801,7 +935,12 @@ def serve(state, host, port, open_browser=True):
             self._send(200 if ok else 409,
                        json.dumps({"ok": ok}).encode("utf-8"), "application/json")
 
-    srv = HTTPServer((host, port), Handler)
+    # Threaded: twelve people polling twice a second against a single-threaded
+    # server serialises every request behind the slowest one.
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    if share:
+        start_tunnel(port)
     url = f"http://localhost:{port}"
     print(f"  advisor running at {url}")
     if host == "0.0.0.0":
@@ -881,6 +1020,8 @@ def main():
     ap.add_argument("--slot", type=int, help="your draft slot (1-12)")
     ap.add_argument("--season", help="defaults to the newest season")
     ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to reach it from your phone")
+    ap.add_argument("--share", action="store_true",
+                    help="expose a public link via cloudflared (read-only)")
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--seed", type=int, default=None, help="repeat a mock draft exactly")
     ap.add_argument("--no-open", action="store_true", help="do not launch a browser")
@@ -904,7 +1045,8 @@ def main():
                              daemon=True).start()
         else:
             threading.Thread(target=lambda: poll_live(state), daemon=True).start()
-        serve(state, args.host, args.port, open_browser=not args.no_open)
+        serve(state, args.host, args.port, open_browser=not args.no_open,
+              share=args.share)
     elif args.mock:
         run_mock(state, rng)
         summarize(state)
