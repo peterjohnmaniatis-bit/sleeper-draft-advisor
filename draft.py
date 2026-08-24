@@ -30,6 +30,7 @@ from pathlib import Path
 from model import RAW, Players, Season, _load, replacement_ranks
 from tunnel import Tunnel
 import adp as adp_mod
+import strategies as strat_mod
 from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
 ROOT = Path(__file__).resolve().parent
@@ -51,13 +52,10 @@ if hasattr(sys.stdout, "reconfigure"):
 # QB the most replaceable off waivers (24% hit rate), TE barely worth reaching
 # for (32 VOR), and a quarter of round 3 league-wide goes to QBs -- so waiting
 # means the RB/WR those three teams pass on falls to you.
-DIRECTIVE = {
-    "label": "Hero RB, late QB, let TE come to you",
-    "earliest_round": {"QB": 8, "TE": 5, "K": 14, "DEF": 14},
-    "max_by_round": {("RB", 5): 2},      # at most 2 RB through round 5
-    "want_by_round": {"RB": 2},          # one anchor RB by the end of round 2
-    "roster_caps": {"QB": 2, "K": 1, "DEF": 1, "TE": 2, "RB": 6, "WR": 7},
-}
+# The advisor's own plan, and the fallback for anyone who has not chosen. Every
+# strategy on the landing page comes from strategies.py, so the mock and the
+# live board can never drift apart on what a strategy means.
+DIRECTIVE = strat_mod.to_directive(strat_mod.DEFAULT_KEY)
 
 
 def get(path, timeout=15):
@@ -155,10 +153,7 @@ def roster_counts(roster, board_by_id):
 # Two reasons. It is more honest advice for them -- my plan is built around my
 # roster and this league's read on me -- and it keeps a shared link from
 # broadcasting my strategy and my positional blocks to eleven opponents.
-OPEN_DIRECTIVE = {"label": "Best available", "earliest_round": {},
-                  "max_by_round": {}, "want_by_round": {},
-                  "roster_caps": {"QB": 3, "K": 2, "DEF": 2, "TE": 3,
-                                  "RB": 8, "WR": 9}}
+OPEN_DIRECTIVE = strat_mod.to_directive("best")
 
 
 def directive_check(pos, rnd, counts, directive=None):
@@ -172,6 +167,12 @@ def directive_check(pos, rnd, counts, directive=None):
     earliest = d["earliest_round"].get(pos)
     if earliest and rnd < earliest:
         return False, f"directive: no {pos} before round {earliest}", "timing"
+    # Dead zone: a band of rounds the strategy skips entirely. Not expressible
+    # as "earliest", because the position is fine before it and after it -- it
+    # is the middle that the strategy is avoiding.
+    lo_hi = (d.get("banned_rounds") or {}).get(pos)
+    if lo_hi and lo_hi[0] <= rnd <= lo_hi[1]:
+        return False, f"dead zone: no {pos} in rounds {lo_hi[0]}-{lo_hi[1]}", "timing"
     cap = d["roster_caps"].get(pos)
     if cap is not None and counts.get(pos, 0) >= cap:
         return False, f"already have {counts[pos]} {pos}", "cap"
@@ -471,7 +472,7 @@ class DraftState:
         self.rosters[manager].append(player_id)
 
     # -- advice ---------------------------------------------------------
-    def advice(self, seat=None):
+    def advice(self, seat=None, strategy=None):
         """Advice from ONE seat's point of view.
 
         Defaults to my own seat. A shared link passes ?me=<manager> so each
@@ -491,7 +492,15 @@ class DraftState:
         seat_name = (self.order[seat - 1] if len(self.order) >= seat
                      else self.my_name)
         mine = self.rosters[seat_name]
-        d = DIRECTIVE if (seat == self.slot or self.share_all) else OPEN_DIRECTIVE
+        # The viewer's own choice wins. Falling back to my directive for my
+        # seat, and to plain best-available for anyone who has not chosen,
+        # keeps every existing caller working unchanged.
+        if strategy and strategy in strat_mod.BY_KEY:
+            d = strat_mod.to_directive(strategy)
+        elif seat == self.slot or self.share_all:
+            d = DIRECTIVE
+        else:
+            d = OPEN_DIRECTIVE
         allowed, blocked, cols = recommend(self.board, self.taken, mine, rnd, pk,
                                            gap, self.league_norm, directive=d)
         counts = roster_counts(mine, self.by_id)
@@ -514,6 +523,12 @@ class DraftState:
         # One blue ring on the whole board, on the highest-scoring player the
         # directive allows. Taken from the COLUMNS, never from allowed[0], so
         # the ring can never land on a player who is not on screen.
+        # Shipped so a blocked tile can say how much BETTER it is than anything
+        # the strategy allows. Clamping that to zero and printing "-0" on the
+        # two best players on the board -- which is what Zero RB does to Gibbs
+        # and Robinson -- throws away the one number that makes the rule's
+        # price legible on the tile itself.
+        best_vor = best
         col_ok = [r for col in cols.values() for r in col if r["allowed"]]
         top_id = (max(col_ok, key=lambda r: r["score"])["player_id"]
                   if col_ok else None)
@@ -533,6 +548,7 @@ class DraftState:
             "by_pos": {pos: [{k: r[k] for k in COL_FIELDS} for r in col]
                        for pos, col in cols.items()},
             "top_id": top_id,
+            "best_vor": best_vor,
             "per_pos": PER_POS,
             "warn": directive_cost(allowed, blocked),
             "wait": wait,
@@ -541,6 +557,7 @@ class DraftState:
             "counts": dict(counts),
             "recent": list(reversed(self.picks[-8:])),
             "directive": d["label"],
+            "strategy": d.get("key"),
             "order_known": self.order_known,
             "stale": round(time.time() - self.last_ok),
             "manual": self.manual,
@@ -800,6 +817,40 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 :root[data-theme="dark"]{
   --cQB:#9085e9;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
 
+/* Landing page: pick a seat, then pick a plan. Card per approach with its
+   grade against this league, and the full write-up for whichever is selected. */
+.card{background:var(--surface);border:1px solid var(--hairline);
+  border-radius:10px;padding:18px;margin-top:12px}
+.card h3{margin:0 0 4px;font-size:12px;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--ink-2)}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 4px}
+.row button{font:inherit;cursor:pointer;border-radius:8px;
+  border:1px solid var(--hairline);background:var(--page);color:var(--ink);
+  padding:9px 14px}
+.row button:hover{border-color:var(--accent)}
+.row button.sel{background:var(--accent);color:#fff;border-color:var(--accent);
+  font-weight:600}
+button.primary{font:inherit;background:var(--accent);color:#fff;
+  border:1px solid var(--accent);border-radius:8px;font-weight:600;
+  padding:11px 22px;font-size:16px;cursor:pointer}
+button.primary:disabled{opacity:.45;cursor:not-allowed}
+.strats{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:9px}
+.strat{border:1px solid var(--hairline);border-radius:9px;padding:10px 12px;
+  background:var(--page);cursor:pointer}
+.strat:hover{border-color:var(--accent)}
+.strat.sel{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);
+  background:var(--surface)}
+.strat .sh{display:flex;align-items:center;gap:8px}
+.strat .sn{font-weight:600;font-size:14px}
+.strat .so{margin:6px 0 0;font-size:12px;color:var(--ink-2);line-height:1.4}
+.grade{font-size:11px;font-weight:700;padding:2px 7px;border-radius:999px;
+  letter-spacing:.02em;color:#fff;background:var(--muted)}
+.grade.gA{background:#0ca30c}.grade.gB{background:#2a78d6}
+.grade.gC{background:#c98500}.grade.gD{background:#e34948}
+.grade.gF{background:#b02020}
+.sdetail{margin-top:12px;padding-top:12px;border-top:1px solid var(--grid)}
+.sdetail h4{margin:0 0 6px;font-size:15px;display:flex;align-items:center;gap:8px}
+.sdetail p{margin:0 0 8px;font-size:13.5px;color:var(--ink-2);max-width:70ch}
 .dens{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
 .dens .d{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--surface);
   border:1px solid var(--hairline);border-left-width:3px;color:var(--ink-2)}
@@ -873,6 +924,14 @@ function board(s){
    actually making. Fed by s.by_pos, which the server fills in board order. */
 const POS = ['QB','RB','WR','TE','K','DEF'];
 
+function costLabel(x, s){
+  const bv = s.best_vor;
+  if(!x.allowed && bv != null && x.vor > bv + 0.5)
+    return '+<b>'+(x.vor - bv).toFixed(0)+'</b>';
+  if(x.allowed && x.cost < 0.5) return '<b>best</b>';
+  return '-<b>'+x.cost.toFixed(0)+'</b>';
+}
+
 function columns(s, live){
   const bp = s.by_pos || {};
   let top = null;
@@ -908,8 +967,12 @@ function columns(s, live){
                  among allowed rows, so a blocked player above that mark would
                  otherwise print "best" too and two tiles would claim it at
                  once. The 0.5 floor stops a 0.4 cost rendering as "-0". */
-              '<span>'+(x.allowed && x.cost<0.5 ? '<b>best</b>'
-                        : '-<b>'+x.cost.toFixed(0)+'</b>')+'</span>'+
+              /* "best" only ever on an ALLOWED tile: `cost` is measured
+                 against the best VOR the strategy permits, so a blocked player
+                 above that mark also prices to zero. Those are the ones worth
+                 the most, so show what the rule is costing (+N) rather than a
+                 meaningless "-0". */
+              '<span>'+costLabel(x, s)+'</span>'+
               '<span><b>'+x.survives+'%</b> back</span><span></span>'+
             '</div></div>';
         }).join('')+'</div>';
@@ -939,11 +1002,80 @@ function pool(s, live){
   }).join('')+'</div>';
 }
 
-/* Which seat this browser watches from. Kept in the URL so a link sent to a
-   league member carries their own seat, and in localStorage so a refresh
-   mid-draft does not dump them back onto somebody else's view. */
-var SEAT = (new URLSearchParams(location.search)).get('me')
-        || localStorage.getItem('ff_seat') || '';
+/* The strategy catalogue is baked in at server start rather than shipped on
+   every poll: it is static, and its long copy would add ~8 KB to a request
+   made every 1.5 seconds. */
+const STRATEGIES = /*__STRATEGIES__*/;
+
+/* Which seat this browser watches from, and which plan it is drafting to.
+   Both live in the URL so a link can be sent pre-aimed, and in localStorage so
+   a refresh mid-draft does not dump anyone back onto somebody else's view. */
+var Q0 = new URLSearchParams(location.search);
+var SEAT = Q0.get('me') || localStorage.getItem('ff_seat') || '';
+var STRAT = Q0.get('strategy') || localStorage.getItem('ff_strategy') || '';
+/* Chosen but not yet started, so the setup screen can show a selection before
+   it is committed. */
+var PICK_SEAT = SEAT, PICK_STRAT = STRAT;
+
+function setupDone(){ return !!(SEAT && STRAT); }
+
+function saveChoice(){
+  SEAT = PICK_SEAT; STRAT = PICK_STRAT;
+  try{
+    localStorage.setItem('ff_seat', SEAT);
+    localStorage.setItem('ff_strategy', STRAT);
+  }catch(e){}
+  var u = new URL(location);
+  u.searchParams.set('me', SEAT);
+  u.searchParams.set('strategy', STRAT);
+  history.replaceState(null, '', u);
+  tick();
+}
+function chooseSeat(v){ PICK_SEAT = v; renderSetup(LAST); }
+function chooseStrat(v){ PICK_STRAT = v; renderSetup(LAST); }
+function reopenSetup(){
+  PICK_SEAT = SEAT; PICK_STRAT = STRAT;
+  SEAT = ''; STRAT = '';
+  renderSetup(LAST);
+}
+
+var LAST = null;   /* most recent state, so the setup screen can re-render */
+
+function gradeClass(g){ return 'g' + (g || '').charAt(0); }
+
+function renderSetup(s){
+  const mgrs = (s && s.managers) || [];
+  const chosen = STRATEGIES.filter(function(x){ return x.key === PICK_STRAT; })[0];
+  document.getElementById('seatbar').innerHTML = '';
+  document.getElementById('main').innerHTML =
+    '<div class="card"><h3>1. Which manager are you?</h3><div class="row">'+
+      mgrs.map(function(m){
+        return '<button data-v="'+esc(m)+'" onclick="chooseSeat(this.dataset.v)"'+
+          (m===PICK_SEAT?' class="sel"':'')+'>'+esc(m)+'</button>';
+      }).join('')+
+      '</div><p class="note">Your draft slot is filled in from the real order.</p>'+
+    '</div>'+
+    '<div class="card"><h3>2. Strategy</h3>'+
+      '<p class="note" style="margin-top:0">Graded against <b>this</b> league '+
+      '&mdash; 12 teams, full PPR, one quarterback, two flex spots. The grade '+
+      'is about fit here, not whether the strategy is any good in general.</p>'+
+      '<div class="strats">'+STRATEGIES.map(function(x){
+        return '<div class="strat'+(x.key===PICK_STRAT?' sel':'')+
+          '" data-v="'+esc(x.key)+'" onclick="chooseStrat(this.dataset.v)">'+
+          '<div class="sh"><span class="grade '+gradeClass(x.grade)+'">'+
+          esc(x.grade)+'</span><span class="sn">'+esc(x.label)+'</span></div>'+
+          '<p class="so">'+esc(x.one)+'</p></div>';
+      }).join('')+'</div>'+
+      (chosen ? '<div class="sdetail"><h4><span class="grade '+
+        gradeClass(chosen.grade)+'">'+esc(chosen.grade)+'</span>'+
+        esc(chosen.label)+'</h4><p>'+esc(chosen.detail)+'</p>'+
+        '<p><b>For this league:</b> '+esc(chosen.verdict)+'</p></div>' : '')+
+    '</div>'+
+    '<p style="margin-top:18px"><button class="primary" onclick="saveChoice()"'+
+      (PICK_SEAT && PICK_STRAT ? '' : ' disabled')+'>'+
+      (PICK_SEAT && PICK_STRAT ? 'Start advising for '+esc(PICK_SEAT)
+                               : 'Pick a manager and a strategy')+'</button></p>';
+}
 function setSeat(v){
   SEAT = v; try{ localStorage.setItem('ff_seat', v); }catch(e){}
   var u = new URL(location); u.searchParams.set('me', v);
@@ -952,6 +1084,9 @@ function setSeat(v){
 function seatBar(s){
   if(!s.managers || !s.managers.length) return '';
   return '<div class="seatbar"><span class="lbl">Watching as</span>'+
+    '<button onclick="reopenSetup()" title="Change seat or strategy">'+
+      esc(s.seat_name || SEAT)+' · '+esc(s.directive)+' ⚙</button>'+
+    '<span class="lbl" style="margin-left:8px">or jump to</span>'+
     s.managers.map(function(m){
       /* Read the name back off the dataset rather than interpolating it into
          a JS string literal -- a manager display name is user-controlled and
@@ -979,12 +1114,24 @@ function offline(on){
 async function tick(){
   let s;
   try{
-    const resp = await fetch('/api/state?me='+encodeURIComponent(SEAT));
+    const resp = await fetch('/api/state?me='+encodeURIComponent(SEAT)+
+                             '&strategy='+encodeURIComponent(STRAT));
     if(!resp.ok) throw new Error('http '+resp.status);
     s = await resp.json();
     MISSES = 0; offline(false);
   }catch(e){
     if(++MISSES >= 2) offline(true);
+    return;
+  }
+  LAST = s;
+  /* Nothing renders until a seat and a plan are chosen. Guessing either would
+     be worse than asking: picks-until-next drives the whole ranking, and a
+     strategy silently defaulted to mine would give someone else confident
+     advice built around my roster. */
+  if(!setupDone()){
+    document.getElementById('sub').textContent =
+      'Pick your seat and your plan to begin';
+    renderSetup(s);
     return;
   }
   const sub = document.getElementById('sub');
@@ -1041,7 +1188,11 @@ tick(); setInterval(tick, 1500);
 def serve(state, host, port, open_browser=True, share=False,
           aggressive=False):
     from report import CSS
-    page = PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
+    cards = [{k: st[k] for k in ("key", "label", "grade", "one", "detail",
+                                 "verdict")} for st in strat_mod.STRATEGIES]
+    page = (PAGE.replace("/*__CSS__*/", CSS)
+                .replace("/*__STRATEGIES__*/", json.dumps(cards))
+                .encode("utf-8"))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1059,9 +1210,10 @@ def serve(state, host, port, open_browser=True, share=False,
                 q = urllib.parse.parse_qs(
                     urllib.parse.urlparse(self.path).query)
                 who = (q.get("me") or [""])[0]
+                strat = (q.get("strategy") or [""])[0]
                 with state.lock:
                     seat = state.seat_of(who)
-                    body = json.dumps(state.advice(seat)).encode("utf-8")
+                    body = json.dumps(state.advice(seat, strat)).encode("utf-8")
                 self._send(200, body, "application/json")
             else:
                 self._send(200, page, "text/html; charset=utf-8")
