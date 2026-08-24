@@ -226,12 +226,25 @@ def survival_for(p, queue_rank, picks_until_next, league_norm, rnd, next_pick):
     return survival(queue_rank, picks_until_next, league_norm, rnd, p["pos"]), "queue"
 
 
+# Six deep at every position, which is what the page draws. Not the top six
+# overall: a cross-position list collapses onto whichever position happens to
+# be deepest and hides the choice you are actually making.
+PER_POS = 6
+
+# Only these fields reach the browser. The scan also carries score, surv_src,
+# proj and adp_gap, and six positions x six players of those would pad every
+# poll for no pixel on screen.
+COL_FIELDS = ("player_id", "name", "pos", "vor", "rank", "adp",
+              "survives", "cost", "allowed", "note", "block_kind")
+
+
 def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
-              limit=6, directive=None):
+              limit=6, directive=None, per_pos=PER_POS):
     """Rank the available players for this pick."""
     by_id = {p["player_id"]: p for p in board}
     counts = roster_counts(roster, by_id)
     out = []
+    cols = defaultdict(list)
     queue = defaultdict(int)   # how many better players remain at each position
     for p in board:
         if p["player_id"] in taken:
@@ -246,15 +259,23 @@ def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
         # below the abundant one -- exactly backwards.
         urgency = max(0.0, p["vor"]) * (1.0 - surv)
         score = p["vor"] + urgency * 0.5 - (0 if ok else 10_000)
-        out.append({**p, "allowed": ok, "note": note, "block_kind": kind,
-                    "survives": round(surv * 100), "surv_src": surv_src,
-                    "score": round(score, 1)})
+        row = {**p, "allowed": ok, "note": note, "block_kind": kind,
+               "survives": round(surv * 100), "surv_src": surv_src,
+               "score": round(score, 1)}
+        out.append(row)
+        # The SAME dict object goes into the column, so one cost pass in
+        # advice() reaches both lists. Filled in board order, not score order:
+        # a column means "the best six left here", and re-sorting it by a
+        # score that already folds in scarcity would shuffle the column for a
+        # reason the column does not show.
+        if len(cols[p["pos"]]) < per_pos:
+            cols[p["pos"]].append(row)
         if len(out) > 260:
             break
     out.sort(key=lambda p: -p["score"])
     allowed = [p for p in out if p["allowed"]][:limit]
     blocked = [p for p in out if not p["allowed"]][:2]
-    return allowed, blocked
+    return allowed, blocked, dict(cols)
 
 
 def wait_advice(allowed, next_pick, safe=60, gone=25):
@@ -471,18 +492,31 @@ class DraftState:
                      else self.my_name)
         mine = self.rosters[seat_name]
         d = DIRECTIVE if (seat == self.slot or self.share_all) else OPEN_DIRECTIVE
-        allowed, blocked = recommend(self.board, self.taken, mine, rnd, pk,
-                                     gap, self.league_norm, directive=d)
+        allowed, blocked, cols = recommend(self.board, self.taken, mine, rnd, pk,
+                                           gap, self.league_norm, directive=d)
         counts = roster_counts(mine, self.by_id)
         # What each option costs against the best thing on the board. This is
         # the number that curbs reaching: take row 4 and you see the price.
         # Priced against the highest VOR on offer, not against row one. Rows
         # are ordered by score (which folds in scarcity), so row one is not
         # always the most valuable player and a naive difference goes negative.
-        if allowed:
-            best = max(r["vor"] for r in allowed)
-            for r in allowed:
-                r["cost"] = round(max(0.0, best - r["vor"]), 1)
+        # Priced against the highest VOR the directive allows ANYWHERE, so the
+        # figure is comparable across all six columns. Never against row one:
+        # rows are ordered by score, which folds in scarcity, so row one is not
+        # always the most valuable player and a naive difference goes negative.
+        # Blocked tiles get a price too -- showing what the rule costs is the
+        # entire reason they stay on screen.
+        rows = allowed + [r for col in cols.values() for r in col]
+        best = max((r["vor"] for r in rows if r["allowed"]), default=None)
+        for r in rows:
+            r["cost"] = (round(max(0.0, best - r["vor"]), 1)
+                         if best is not None else 0.0)
+        # One blue ring on the whole board, on the highest-scoring player the
+        # directive allows. Taken from the COLUMNS, never from allowed[0], so
+        # the ring can never land on a player who is not on screen.
+        col_ok = [r for col in cols.values() for r in col if r["allowed"]]
+        top_id = (max(col_ok, key=lambda r: r["score"])["player_id"]
+                  if col_ok else None)
         mine_seat = seat == self.slot
         wait = wait_advice(allowed, nxt) if (mine_seat or self.share_all) else None
         return {
@@ -492,6 +526,14 @@ class DraftState:
             "managers": list(self.order),
             "picks_until_next": gap,
             "recommend": allowed, "blocked": blocked,
+            # One column per position, board order, fully decorated -- this is
+            # what the page renders. `recommend` stays as it is because the
+            # console renderer, wait_advice and directive_cost all read it as a
+            # flat score-ordered list.
+            "by_pos": {pos: [{k: r[k] for k in COL_FIELDS} for r in col]
+                       for pos, col in cols.items()},
+            "top_id": top_id,
+            "per_pos": PER_POS,
             "warn": directive_cost(allowed, blocked),
             "wait": wait,
             "roster": [self.by_id.get(p, {"name": self.players.name(p), "pos": "?",
@@ -679,12 +721,50 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .wrap{max-width:1380px}
 .grid{display:grid;grid-template-columns:1fr 320px;gap:16px;align-items:start}
 @media(max-width:820px){.grid{grid-template-columns:1fr}}
-.rec{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;
-     border:1px solid var(--hairline);margin-bottom:6px;background:var(--surface)}
-.rec.top{border-color:var(--accent);border-width:2px}
-.rec .nm{font-weight:600;flex:1}
-.rec .pos{font-size:12px;color:var(--muted);width:32px}
-.rec .num{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:13px}
+/* One column per position, six deep. Every player on screen is pickable. */
+.board6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:0 0 14px}
+@media(max-width:1240px){.board6{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:760px){.board6{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.board6{grid-template-columns:1fr}}
+/* report.CSS ships a title-case h3 with a 26px top margin, so a column heading
+   restates size, case and margin the way .pool h3 already does. nowrap is
+   load-bearing, not tidiness: a directive note long enough to wrap pushes that
+   one column ~19px below the other five, and the 1241-1300px band packs six
+   columns into ~1200px where exactly that happens. */
+.poscol h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--ink-2);font-weight:700;
+  border-left:3px solid var(--muted);padding-left:7px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.poscol h3.cQB{border-left-color:var(--cQB)}.poscol h3.cRB{border-left-color:var(--cRB)}
+.poscol h3.cWR{border-left-color:var(--cWR)}.poscol h3.cTE{border-left-color:var(--cTE)}
+.poscol h3.cK{border-left-color:var(--cK)}.poscol h3.cDEF{border-left-color:var(--cDEF)}
+.poscol h3 .blk{text-transform:none;letter-spacing:0;font-weight:400;
+  color:var(--neg);font-size:11px}
+/* The whole tile carries the position, not just an edge. A low-percentage tint
+   of the position hue keeps body text at full contrast in both themes, which a
+   saturated fill would not. */
+.rec{display:block;padding:8px 10px;border-radius:8px;background:var(--surface);
+     border:1px solid var(--hairline);border-left:3px solid var(--muted);margin-bottom:6px}
+.rec.cQB{background:color-mix(in srgb,var(--cQB) 15%,var(--surface));border-left-color:var(--cQB)}
+.rec.cRB{background:color-mix(in srgb,var(--cRB) 15%,var(--surface));border-left-color:var(--cRB)}
+.rec.cWR{background:color-mix(in srgb,var(--cWR) 15%,var(--surface));border-left-color:var(--cWR)}
+.rec.cTE{background:color-mix(in srgb,var(--cTE) 15%,var(--surface));border-left-color:var(--cTE)}
+.rec.cK{background:color-mix(in srgb,var(--cK) 15%,var(--surface));border-left-color:var(--cK)}
+.rec.cDEF{background:color-mix(in srgb,var(--cDEF) 15%,var(--surface));border-left-color:var(--cDEF)}
+/* Blue is never a position -- it only ever means "the tool is pointing here". */
+.rec.top{box-shadow:inset 0 0 0 2px var(--accent);border-color:var(--accent)}
+/* Blocked tiles are desaturated, NOT faded. This directive blocks four of six
+   positions early, so a 0.45 opacity would put 30 of 36 tiles' numbers at
+   roughly 1.5:1 contrast -- unreadable, on a page being read against a pick
+   clock. The red note in the column heading is what actually says "blocked". */
+.rec.off{filter:saturate(.25)}
+.rec.off .nm{color:var(--ink-2);font-weight:500}
+.rec .nm{display:block;font-weight:600;font-size:13.5px;line-height:1.25;
+     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rec .mets{display:grid;grid-template-columns:1fr auto;gap:1px 8px;margin-top:5px;
+     font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.rec .mets span:nth-child(even){text-align:right}
+.rec .mets b{color:var(--ink);font-weight:600}
 
 .offline{display:none;background:var(--neg);color:#fff;padding:10px 14px;border-radius:8px;margin:10px 0;font-weight:600}
 .seatbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 4px}
@@ -710,17 +790,25 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 /* Position hues: reference palette slots 1-6, fixed order, never cycled.
    Every cell also carries the position as text, so colour is never the only
-   thing telling you what a player is. */
-:root{--cQB:#2a78d6;--cRB:#eb6834;--cWR:#1baf7a;--cTE:#eda100;--cK:#e87ba4;--cDEF:#008300}
+   thing telling you what a player is. Quarterbacks are purple rather than
+   blue: blue is reserved for "the tool is pointing here" (the .rec.top ring,
+   the turn banner, the selected seat), and the old --cQB was byte-identical
+   to --accent, which made a ringed quarterback ambiguous. */
+:root{--cQB:#4a3aa7;--cRB:#eb6834;--cWR:#1baf7a;--cTE:#eda100;--cK:#e87ba4;--cDEF:#008300}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}}
+  --cQB:#9085e9;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}}
 :root[data-theme="dark"]{
-  --cQB:#3987e5;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
+  --cQB:#9085e9;--cRB:#d95926;--cWR:#199e70;--cTE:#c98500;--cK:#d55181;--cDEF:#008300}
 
+.dens{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.dens .d{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--surface);
+  border:1px solid var(--hairline);border-left-width:3px;color:var(--ink-2)}
+.dens .d b{color:var(--ink);font-variant-numeric:tabular-nums}
 .pick-on .rec{cursor:pointer}
-.pick-on .rec:hover{border-color:var(--accent);background:var(--page)}
-.rec .go{font-size:12px;color:var(--accent);font-weight:600;opacity:0}
-.pick-on .rec:hover .go{opacity:1}
+/* Hover must restore a blocked tile to full colour: blocked tiles stay
+   clickable, because the directive exists to show a cost, not to stop you. */
+.pick-on .rec:hover{filter:brightness(1.06);border-color:var(--accent)}
+.pick-on .rec:hover .nm{color:var(--ink);font-weight:600}
 
 .board{overflow-x:auto;padding-bottom:6px}
 .board table{border-collapse:separate;border-spacing:3px;width:auto;font-size:11px}
@@ -752,7 +840,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p><div id="seatbar"></div><div id="offline" class="offline"></div>
 <div id="main"></div></div>
 <script>
-const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 async function pick(pid){
   try{
@@ -779,9 +867,72 @@ function board(s){
   return '<div class="board"><table>'+head+rows+'</table></div>';
 }
 
+/* One column per position, PER_POS deep -- the best six left at EVERY
+   position, not the best six overall. A cross-position list collapses onto
+   whichever position happens to be deepest and hides the choice you are
+   actually making. Fed by s.by_pos, which the server fills in board order. */
+const POS = ['QB','RB','WR','TE','K','DEF'];
+
+function columns(s, live){
+  const bp = s.by_pos || {};
+  let top = null;
+  POS.forEach(function(p){
+    (bp[p]||[]).forEach(function(x){ if(x.player_id===s.top_id) top = x; });
+  });
+  return '<p class="note" style="margin:0 0 10px">The best '+(s.per_pos||6)+
+    ' left at every position'+(live?' \\u2014 click any of them to draft him':'')+'. '+
+    (top?'Best value on the board right now: <b>'+esc(top.name)+'</b> ('+
+      esc(top.pos)+', VOR '+top.vor.toFixed(0)+').':'')+'</p>'+
+    '<div class="board6">'+POS.map(function(p){
+      const list = bp[p] || [];
+      if(!list.length) return '';
+      /* A directive rule blocks a whole position at once, so the top player's
+         reason stands for the entire column -- which is why the old flat
+         blocked list underneath is gone: it only ever repeated these. */
+      const blk = list[0].allowed ? '' : list[0].note;
+      return '<div class="poscol"><h3 class="c'+p+'">'+p+
+        (blk?' <span class="blk" title="'+esc(blk)+'">'+esc(blk)+'</span>':'')+'</h3>'+
+        list.map(function(x){
+          /* Blocked tiles stay clickable on purpose -- the directive is there
+             to show a cost, not to stop you. The server refuses the POST
+             outside rehearsal anyway. */
+          return '<div class="rec c'+p+(x.allowed?'':' off')+
+            (x.player_id===s.top_id?' top':'')+'"'+
+            (live?' onclick="pick(\\''+x.player_id+'\\')"':'')+'>'+
+            '<span class="nm">'+esc(x.name)+'</span>'+
+            '<div class="mets">'+
+              '<span>VOR <b>'+x.vor.toFixed(0)+'</b></span>'+
+              '<span>#'+x.rank+'</span>'+
+              '<span>adp <b>'+(x.adp==null?'-':x.adp.toFixed(1))+'</b></span>'+
+              /* "best" only ever on an ALLOWED tile: `best` is the max VOR
+                 among allowed rows, so a blocked player above that mark would
+                 otherwise print "best" too and two tiles would claim it at
+                 once. The 0.5 floor stops a 0.4 cost rendering as "-0". */
+              '<span>'+(x.allowed && x.cost<0.5 ? '<b>best</b>'
+                        : '-<b>'+x.cost.toFixed(0)+'</b>')+'</span>'+
+              '<span><b>'+x.survives+'%</b> back</span><span></span>'+
+            '</div></div>';
+        }).join('')+'</div>';
+    }).join('')+'</div>';
+}
+
+/* Position density at a glance. The mock fills this cell with a full starting
+   lineup table; this is the cheap half of it, and it answers the question that
+   actually matters mid-draft -- how many of each do I already have. */
+function density(s){
+  const c = s.counts || {};
+  return '<div class="dens">'+POS.map(function(p){
+    return '<span class="d c'+p+'">'+p+' <b>'+(c[p]||0)+'</b></span>';
+  }).join('')+'</div>';
+}
+
 function pool(s, live){
-  return '<div class="pool">'+['QB','RB','WR','TE','K','DEF'].map(p=>{
-    const list = (s.available[p]||[]).slice(0,8).map(a =>
+  /* Starts where the board stops. available[] is the same VOR-sorted board
+     sliced per position, so its first PER_POS entries are byte-identical to
+     the columns above -- rendering from 0 would print the whole board twice. */
+  const skip = s.per_pos || 6;
+  return '<div class="pool">'+POS.map(p=>{
+    const list = (s.available[p]||[]).slice(skip, skip+8).map(a =>
       '<div class="av c'+p+'"'+(live?' onclick="pick(\\''+a.player_id+'\\')"':'')+'>'+
       '<span>'+esc(a.name)+'</span><span class="v">'+a.vor.toFixed(0)+'</span></div>').join('');
     return list ? '<div><h3>'+p+'</h3>'+list+'</div>' : '';
@@ -848,17 +999,6 @@ async function tick(){
   const live = !!(s.manual && s.awaiting && s.my_turn);
   document.body.className = live ? 'pick-on' : '';
 
-  const rec = s.recommend.map((r,i)=>
-    '<div class="rec'+(i===0?' top':'')+'"'+(live?' onclick="pick(\\''+r.player_id+'\\')"':'')+'>'+
-    '<span class="pos">'+esc(r.pos)+'</span><span class="nm">'+esc(r.name)+'</span>'+
-    '<span class="num">VOR '+r.vor.toFixed(0)+'</span>'+
-    '<span class="num">'+(r.cost>0?'costs '+r.cost.toFixed(0):'best')+'</span>'+
-    '<span class="num">#'+r.rank+'</span>'+
-    '<span class="num">'+(r.adp==null?'adp -':'adp '+r.adp.toFixed(1))+'</span>'+
-    '<span class="num">'+r.survives+'% back</span>'+
-    '<span class="go">take</span></div>').join('');
-  const blocked = s.blocked.map(b=>
-    '<div class="blocked">'+esc(b.name)+' ('+esc(b.pos)+') \\u2014 '+esc(b.note)+'</div>').join('');
   const roster = s.roster.map(p=>
     '<span class="chip">'+esc(p.pos)+' '+esc(p.name)+'</span>').join('');
   const recent = s.recent.map(p=>
@@ -880,10 +1020,18 @@ async function tick(){
                    s.picks_until_next+'.</div>')+
     (s.warn ? '<div class="warn">'+esc(s.warn)+'</div>' : '')+
     (s.wait ? '<div class="wait-tip">'+esc(s.wait)+'</div>' : '')+
-    '<div class="grid"><div><h2>Take one of these</h2>'+rec+blocked+'</div>'+
-    '<div><h2>Your roster</h2><div>'+(roster||'<span class="sub">empty</span>')+
-    '</div><h2>Recent picks</h2>'+recent+'</div></div>'+
-    '<h2>Best available</h2>'+pool(s, live)+
+    /* The board goes full width. Six columns inside a 1fr that is also
+       carrying a 320px rail come out ~160px each and the metrics collapse into
+       unreadable digits, so roster and recent picks drop below it. Recent
+       picks takes the wide cell because it is the taller of the two -- the
+       other way round leaves a quarter-screen of dead space. */
+    '<h2>Take one of these</h2>'+columns(s, live)+
+    '<div class="grid"><div><h2>Recent picks</h2>'+recent+'</div>'+
+    '<div><h2>Your roster</h2>'+density(s)+'<div>'+
+      (roster||'<span class="sub">empty</span>')+'</div></div></div>'+
+    '<h2>Deeper at every position</h2>'+
+    '<p class="note" style="margin:0 0 10px">Everyone below the six above, so '+
+    'you are never limited to what the board surfaced.</p>'+pool(s, live)+
     '<h2>Draft board</h2>'+board(s);
 }
 tick(); setInterval(tick, 1500);
