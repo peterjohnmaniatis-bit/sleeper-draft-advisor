@@ -17,8 +17,6 @@ import random
 import sys
 import atexit
 import re
-import shutil
-import subprocess
 import threading
 import time
 import urllib.error
@@ -30,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from model import RAW, Players, Season, _load, replacement_ranks
+from tunnel import Tunnel
 import adp as adp_mod
 from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
@@ -333,6 +332,13 @@ class DraftState:
 
         # Manual rehearsal: the simulation stops on your pick and waits for you
         # to choose, the way the real draft will.
+        # Guests get FACTS -- the value board, the market price, the odds a
+        # player lasts. The owner additionally gets COACHING: the directive and
+        # the "take him now, take the other one later" tip. That line is drawn
+        # deliberately: the facts are all derivable from public data anyway, and
+        # the coaching layer is the part built from this league's own history.
+        # --share-all hands guests everything.
+        self.share_all = True
         self.manual = False
         self.awaiting = False
         self.pending = None
@@ -464,7 +470,7 @@ class DraftState:
         seat_name = (self.order[seat - 1] if len(self.order) >= seat
                      else self.my_name)
         mine = self.rosters[seat_name]
-        d = DIRECTIVE if seat == self.slot else OPEN_DIRECTIVE
+        d = DIRECTIVE if (seat == self.slot or self.share_all) else OPEN_DIRECTIVE
         allowed, blocked = recommend(self.board, self.taken, mine, rnd, pk,
                                      gap, self.league_norm, directive=d)
         counts = roster_counts(mine, self.by_id)
@@ -477,7 +483,8 @@ class DraftState:
             best = max(r["vor"] for r in allowed)
             for r in allowed:
                 r["cost"] = round(max(0.0, best - r["vor"]), 1)
-        wait = wait_advice(allowed, nxt)
+        mine_seat = seat == self.slot
+        wait = wait_advice(allowed, nxt) if (mine_seat or self.share_all) else None
         return {
             "done": False, "pick_no": pk, "round": rnd, "slot": slot,
             "on_clock": on_clock, "my_turn": slot == seat,
@@ -552,19 +559,45 @@ def run_mock(state, rng, verbose=True):
 BOT_CAPS = {"QB": 2, "TE": 2, "RB": 6, "WR": 6, "K": 1, "DEF": 1}
 
 
+def market_order(state, pos=None):
+    """Available players in the order the MARKET would take them.
+
+    Bots used to take the top of our own value board at the chosen position,
+    which quietly made rehearsal a lie: any player we rate above the market
+    vanished immediately, so practising against it taught the opposite of who
+    really falls. Real drafters take roughly the consensus next man, so the
+    simulation should too. No ADP means the market has no opinion -- sort him
+    to the back rather than to the front.
+    """
+    free = [p for p in state.board
+            if p["player_id"] not in state.taken
+            and (pos is None or p["pos"] == pos)]
+    free.sort(key=lambda p: p["adp"] if p.get("adp") is not None else 9999)
+    return free
+
+
 def bot_pick(state, mgr, rnd, rng):
     """One opponent's selection: sample a position from that manager's own
-    draft history, respect roster sanity, then take the best available there."""
+    draft history, respect roster sanity, then take near the top of the
+    market at that position."""
     counts = roster_counts(state.rosters[mgr], state.by_id)
     dist = state.tendencies.get(mgr, {}).get(rnd) or state.league_norm.get(rnd, {})
     dist = {p: w for p, w in dist.items()
             if p in SKILL and counts.get(p, 0) < BOT_CAPS.get(p, 99)}
     pos = weighted_pick(dist, rng) if dist else None
-    free = (p for p in state.board if p["player_id"] not in state.taken)
-    if pos is None:
-        return next(free, None)
-    return next((p for p in state.board if p["player_id"] not in state.taken
-                 and p["pos"] == pos), next(free, None))
+    pool = market_order(state, pos) or market_order(state)
+    if not pool:
+        return None
+    # Not strictly the top of the market: real drafts scatter around ADP, and a
+    # perfectly obedient bot would make the survival numbers look sharper than
+    # they are. Weighted toward the consensus pick, with a tail.
+    weights = [0.55, 0.25, 0.12, 0.08][:len(pool)]
+    r = rng.random() * sum(weights)
+    for i, w in enumerate(weights):
+        r -= w
+        if r <= 0:
+            return pool[i]
+    return pool[0]
 
 
 def weighted_pick(dist, rng):
@@ -653,6 +686,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .rec .pos{font-size:12px;color:var(--muted);width:32px}
 .rec .num{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:13px}
 
+.offline{display:none;background:var(--neg);color:#fff;padding:10px 14px;border-radius:8px;margin:10px 0;font-weight:600}
 .seatbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 4px}
 .seatbar .lbl{font-size:12px;text-transform:uppercase;letter-spacing:.05em;
   color:var(--muted);margin-right:4px}
@@ -715,7 +749,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .pick-on .av:hover{background:var(--surface)}
 .av .v{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
 </style></head><body><div class="wrap">
-<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p><div id="seatbar"></div>
+<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p><div id="seatbar"></div><div id="offline" class="offline"></div>
 <div id="main"></div></div>
 <script>
 const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -776,11 +810,32 @@ function seatBar(s){
     }).join('')+'</div>';
 }
 
+/* A dropped connection used to leave the last render on screen with nothing to
+   say it was frozen -- a board that is confidently three rounds out of date is
+   worse than an obviously broken one, especially for a guest on a tunnel that
+   died. Two misses in a row and the page says so. */
+var MISSES = 0;
+function offline(on){
+  var el = document.getElementById('offline');
+  if(!el) return;
+  el.style.display = on ? 'block' : 'none';
+  el.textContent = on
+    ? 'Lost connection to the draft board. These numbers are frozen and may be '
+      + 'out of date. Trying to reconnect...'
+    : '';
+}
+
 async function tick(){
   let s;
   try{
-    s = await (await fetch('/api/state?me='+encodeURIComponent(SEAT))).json();
-  }catch(e){ return; }
+    const resp = await fetch('/api/state?me='+encodeURIComponent(SEAT));
+    if(!resp.ok) throw new Error('http '+resp.status);
+    s = await resp.json();
+    MISSES = 0; offline(false);
+  }catch(e){
+    if(++MISSES >= 2) offline(true);
+    return;
+  }
   const sub = document.getElementById('sub');
   if(s.done){
     sub.textContent = 'Draft complete';
@@ -835,55 +890,8 @@ tick(); setInterval(tick, 1500);
 </script></body></html>"""
 
 
-def start_tunnel(port):
-    """Public read-only link via cloudflared, for league members watching.
-
-    A quick tunnel, so the URL is random and disposable and nothing is
-    registered anywhere. Everything served is already public through Sleeper's
-    own unauthenticated API, and the write endpoint is refused outright outside
-    rehearsal -- but this is still the open internet reaching a port on this
-    machine, so it should be stopped when the draft ends.
-    """
-    exe = shutil.which("cloudflared") or shutil.which("cloudflared.exe")
-    if not exe:
-        print("  ! cloudflared not found -- serving locally only")
-        return
-    proc = subprocess.Popen(
-        [exe, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace", bufsize=1)
-
-    def watch():
-        # Keep draining stdout for the whole run, printing only the first URL.
-        # Stopping early is a deadlock: cloudflared blocks once the pipe buffer
-        # fills, and the tunnel silently stops forwarding while the local
-        # server carries on answering perfectly.
-        seen = False
-        for line in proc.stdout:
-            m = None if seen else re.search(
-                r"https://[-\w.]+\.trycloudflare\.com", line)
-            if m:
-                seen = True
-                # flush=True matters: this runs on a daemon thread and stdout
-                # is block-buffered whenever it is not a terminal, so the one
-                # line the user is waiting for would sit unseen in the buffer.
-                print("", flush=True)
-                print(f"  SHARE THIS: {m.group(0)}", flush=True)
-                print("  Anyone with the link can watch. It stops when you stop",
-                      flush=True)
-                print("  this program.", flush=True)
-                print("", flush=True)
-        # stdout closed: cloudflared exited. The local page keeps working, so
-        # without this the only symptom is league members quietly losing the
-        # link while everything looks fine on this machine.
-        print("\n  ! the public link has stopped. Local page is unaffected.",
-              flush=True)
-        print("    Restart with --share to get a new link.\n", flush=True)
-    threading.Thread(target=watch, daemon=True).start()
-    atexit.register(proc.terminate)
-
-
-def serve(state, host, port, open_browser=True, share=False):
+def serve(state, host, port, open_browser=True, share=False,
+          aggressive=False):
     from report import CSS
     page = PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
 
@@ -939,8 +947,11 @@ def serve(state, host, port, open_browser=True, share=False):
     # server serialises every request behind the slowest one.
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
+    tun = None
     if share:
-        start_tunnel(port)
+        tun = Tunnel(port, aggressive)
+        tun.start()
+        atexit.register(tun.stop)
     url = f"http://localhost:{port}"
     print(f"  advisor running at {url}")
     if host == "0.0.0.0":
@@ -1022,6 +1033,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to reach it from your phone")
     ap.add_argument("--share", action="store_true",
                     help="expose a public link via cloudflared (read-only)")
+    ap.add_argument("--watchdog", action="store_true",
+                    help="auto-restart the tunnel if health checks fail "
+                         "(changes the link address)")
+    ap.add_argument("--private-coaching", action="store_true",
+                    help="keep your directive and wait advice off the shared link")
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--seed", type=int, default=None, help="repeat a mock draft exactly")
     ap.add_argument("--no-open", action="store_true", help="do not launch a browser")
@@ -1033,6 +1049,7 @@ def main():
 
     state = setup(args)
     state.manual = bool(args.manual and args.mock and args.serve)
+    state.share_all = not args.private_coaching
     if args.manual and not (args.mock and args.serve):
         print("  ! --manual needs --serve --mock; ignoring it")
     if state.manual:
@@ -1046,7 +1063,7 @@ def main():
         else:
             threading.Thread(target=lambda: poll_live(state), daemon=True).start()
         serve(state, args.host, args.port, open_browser=not args.no_open,
-              share=args.share)
+              share=args.share, aggressive=args.watchdog)
     elif args.mock:
         run_mock(state, rng)
         summarize(state)
