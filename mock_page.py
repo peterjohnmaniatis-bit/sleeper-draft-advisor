@@ -49,7 +49,7 @@ def collect():
 
     board = [{"i": p["player_id"], "n": p["name"], "p": p["pos"],
               "j": round(p["proj"], 1), "v": round(p["vor"], 1), "r": p["rank"],
-              "ru": rush.get(p["player_id"], 0)}
+              "a": p.get("adp"), "ru": rush.get(p["player_id"], 0)}
              for p in state.board[:BOARD_DEPTH]]
 
     tend, league = opponent_tendencies()
@@ -523,6 +523,30 @@ function nextOwn(after){
     if(slotOnClock(pk)[0]===S.slot) return pk;
   return null;
 }
+/* Availability from the MARKET, not from our own board -- the same fitted model
+   as adp.py, bands measured on 900 real picks from this league's five drafts.
+   The queue model below stays as the fallback for players ADP does not cover.
+   Counting scarcity from our own ranking said A.J. Brown was 25% to last to
+   pick 28 when his ADP of 17.4 means he is usually gone before pick 21. */
+var ADP_BANDS=[[12,-0.2,1.7],[24,0.3,4.6],[48,-0.1,5.7],
+               [84,0.4,8.1],[120,1.6,12.9],[200,-6.0,15.9]];
+var ADP_HORIZON=200;
+function erf(x){                       /* Abramowitz & Stegun 7.1.26; no Math.erf */
+  var s=x<0?-1:1; x=Math.abs(x);
+  var t=1/(1+0.3275911*x);
+  var y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t
+        +0.254829592)*t*Math.exp(-x*x);
+  return s*y;
+}
+function adpSurvival(adp,pick){
+  if(adp==null||adp>ADP_HORIZON) return null;
+  var bias=ADP_BANDS[ADP_BANDS.length-1][1], sd=ADP_BANDS[ADP_BANDS.length-1][2];
+  for(var i=0;i<ADP_BANDS.length;i++){
+    if(adp<=ADP_BANDS[i][0]){ bias=ADP_BANDS[i][1]; sd=ADP_BANDS[i][2]; break; }
+  }
+  var z=(pick+0.5-(adp+bias))/sd;
+  return 1-0.5*(1+erf(z/Math.SQRT2));
+}
 function poissonBelow(k,lam){
   if(lam<=0) return 1;
   let term=Math.exp(-lam), tot=0;
@@ -629,7 +653,8 @@ function recommend(){
     q[p.p]=(q[p.p]||0)+1;                       // queue rank at his position
     if(!byPos[p.p] || byPos[p.p].length>=PER_POS) continue;
     const rate=(DATA.league[String(rnd)]||{})[p.p] || .25;
-    const surv=poissonBelow(q[p.p], gap*rate);
+    const mkt=gap>0? adpSurvival(p.a, pk+gap) : null;
+    const surv=mkt!=null? mkt : poissonBelow(q[p.p], gap*rate);
     const [ok,note,kind]=allowed(p.p,rnd,c);
     byPos[p.p].push({...p,ok,note,kind,surv:Math.round(surv*100)});
   }
@@ -789,10 +814,17 @@ function legend(){
       'on the board beats him. This is the number that stops you reaching.</td></tr>'+
     '<tr><td><b>#</b></td><td>His rank on the whole board by VOR. Rank 40 taken at '+
       'pick 20 means you paid a round or two more than he is worth.</td></tr>'+
+    '<tr><td><b>adp</b></td><td>Average draft position &mdash; the pick the wider market '+
+      'usually takes him at. <b>#</b> is what he is worth; <b>adp</b> is what he costs. '+
+      'A player ranked #20 with an adp of 45 can be had two rounds after his value '+
+      'says, so taking him now is a reach.</td></tr>'+
     '<tr><td><b>% back</b></td><td>The chance he is still on the board when your next '+
       'turn comes round. <b>5% back</b> means take him now or lose him; <b>60% back</b> '+
       'means you can probably grab someone else first and still get him. This is the '+
-      'tiebreak when two players are close in value.</td></tr>'+
+      'tiebreak when two players are close in value. Worked out from his adp and from '+
+      'how far real drafts in this league have strayed from it &mdash; 900 picks across '+
+      'five seasons, where the market proved unbiased for ten rounds and the spread '+
+      'widened from under two picks in round one to sixteen by round eleven.</td></tr>'+
     '<tr><td><b>Greyed rows</b></td><td>Players your chosen strategy is blocking, and '+
       'why. They are shown rather than hidden so you can see what the rule is costing.</td></tr>'+
     '<tr><td><b>Red banner</b></td><td>Appears when your strategy is blocking someone '+
@@ -908,8 +940,9 @@ function render(){
           '<div class="mets">'+
             '<span>VOR <b>'+x.v.toFixed(0)+'</b></span>'+
             '<span>#'+x.r+'</span>'+
+            '<span>adp <b>'+(x.a==null?'-':x.a.toFixed(1))+'</b></span>'+
             '<span>'+(x.cost>0?'-<b>'+x.cost.toFixed(0)+'</b>':'<b>best</b>')+'</span>'+
-            '<span><b>'+x.surv+'%</b> back</span>'+
+            '<span><b>'+x.surv+'%</b> back</span><span></span>'+
             (pos==="QB"&&x.ru ? '<span class="run'+(x.ru>=KONAMI_FLOOR?' hot':'')+
               '"><b>'+x.ru+'</b> carries</span><span></span>' : '')+
           '</div></div>').join('')+'</div>';
