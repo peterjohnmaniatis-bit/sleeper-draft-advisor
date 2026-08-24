@@ -30,6 +30,7 @@ from pathlib import Path
 from model import RAW, Players, Season, _load, replacement_ranks
 from tunnel import Tunnel
 import adp as adp_mod
+import scorecard as scorecard_mod
 import strategies as strat_mod
 from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
@@ -446,6 +447,21 @@ class DraftState:
                 return pk
         return None
 
+    def roast(self):
+        """The live scorecard. Isolated from advice() on purpose: this is a
+        separate page and a bug in the comedy must not be able to take the
+        draft board down with it."""
+        uid_by_name = {n: u for u, n in (self.users or {}).items()}
+        picks = [{"pick_no": p["pick_no"], "round": p["round"],
+                  "manager": p["manager"], "player_id": p["player_id"],
+                  "player": p.get("name"), "pos": p.get("pos"),
+                  "user_id": uid_by_name.get(p["manager"], "")}
+                 for p in self.picks]
+        rows, standings = scorecard_mod.scorecard(picks, self.season)
+        return {"season": self.season, "picks": len(self.picks),
+                "rows": rows, "standings": standings,
+                "order_known": self.order_known}
+
     def seat_of(self, name):
         """Slot number for a manager, or None. Used to give each viewer of a
         shared link the recommendations for THEIR seat rather than mine."""
@@ -730,6 +746,93 @@ def poll_live(state, interval=3.0):
 # Interpolated with str.replace, never with %-formatting: this template holds
 # literal percent signs (CSS units, "% back" in the JS) and %-formatting reads
 # them as format specifiers and raises TypeError.
+ROAST_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Draft scorecard</title><style>/*__CSS__*/
+.wrap{max-width:1040px}
+.gr{display:inline-flex;align-items:center;justify-content:center;width:30px;
+  height:30px;border-radius:8px;font-weight:700;font-size:15px;color:#fff;
+  flex:0 0 30px}
+.gr.A{background:#0ca30c}.gr.B{background:#2a78d6}.gr.C{background:#c98500}
+.gr.D{background:#e07020}.gr.F{background:#b02020}
+.feed{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.ev{display:flex;gap:12px;align-items:flex-start;background:var(--surface);
+  border:1px solid var(--hairline);border-radius:10px;padding:11px 13px}
+.ev.rep{border-color:var(--neg)}
+.ev .bd{flex:1;min-width:0}
+.ev .hd{font-size:12px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.05em}
+.ev .hd b{color:var(--ink-2)}
+.ev .ln{margin:3px 0 0;font-size:15px;line-height:1.45}
+.ev .rec{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--neg);margin-left:6px}
+.tbl{width:100%;border-collapse:collapse;font-size:14px;
+  font-variant-numeric:tabular-nums;margin-top:10px}
+.tbl th{text-align:left;font-size:11px;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--ink-2);border-bottom:1px solid var(--axis);
+  padding:6px 10px 6px 0}
+.tbl td{padding:8px 10px 8px 0;border-bottom:1px solid var(--grid)}
+.tbl td.n,.tbl th.n{text-align:right}
+.tbl tr:first-child td{font-weight:650}
+.empty{color:var(--muted);margin-top:14px}
+</style></head><body>
+<div class="wrap">
+<h1>Draft scorecard</h1><p class="sub" id="sub">waiting for the first pick...</p>
+<div id="main"></div>
+<p class="note" style="margin-top:34px">Grades measure how far ahead of the
+market a pick was, in standard deviations fitted on 900 real picks from this
+league's own drafts. Kickers and defences are not graded &mdash; their ADP is
+noise and reaching there costs nothing. Late rounds are damped, because twelve
+picks early in round two burns a starter and twelve picks early in round
+thirteen burns nobody. Receipts come from five seasons of this league.</p>
+</div>
+<script>
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function feed(rows){
+  if(!rows.length) return '<p class="empty">No graded picks yet. Kickers and '+
+    'defences do not count, and neither does anyone the market has no opinion '+
+    'about.</p>';
+  return '<div class="feed">'+rows.slice().reverse().map(function(r){
+    return '<div class="ev'+(r.repeat?' rep':'')+'">'+
+      '<span class="gr '+r.grade+'">'+r.grade+'</span>'+
+      '<div class="bd"><div class="hd">R'+r.round+' pick '+r.pick_no+' &middot; '+
+        '<b>'+esc(r.manager)+'</b> &middot; '+esc(r.player)+' ('+esc(r.pos)+') '+
+        '&middot; adp '+r.adp+
+        (r.repeat?'<span class="rec">receipts</span>':'')+'</div>'+
+      '<p class="ln">'+esc(r.line)+'</p></div></div>';
+  }).join('')+'</div>';
+}
+
+function table(st){
+  if(!st.length) return '';
+  return '<h2>Standings, worst first</h2><table class="tbl">'+
+    '<tr><th>Manager</th><th class="n">Picks</th><th class="n">GPA</th>'+
+    '<th class="n">Avg picks early</th><th>Worst crime</th></tr>'+
+    st.map(function(m){
+      const w = m.worst;
+      return '<tr><td>'+esc(m.manager)+'</td><td class="n">'+m.picks+'</td>'+
+        '<td class="n">'+m.gpa.toFixed(2)+'</td>'+
+        '<td class="n">'+(m.mean_over>0?'+':'')+m.mean_over.toFixed(1)+'</td>'+
+        '<td>'+(w?esc(w.player)+' ('+(w.over>0?'+':'')+w.over.toFixed(0)+')':'&mdash;')+
+        '</td></tr>';
+    }).join('')+'</table>';
+}
+
+async function tick(){
+  let s;
+  try{ s = await (await fetch('/api/scorecard')).json(); }catch(e){ return; }
+  const sub = document.getElementById('sub');
+  if(s.error){ sub.textContent = 'scorecard error: '+s.error; return; }
+  sub.textContent = s.picks+' picks in, '+s.rows.length+' of them graded';
+  document.getElementById('main').innerHTML = table(s.standings)+
+    '<h2>Every pick, most recent first</h2>'+feed(s.rows);
+}
+tick(); setInterval(tick, 3000);
+</script></body></html>
+"""
+
+
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Draft advisor</title><style>/*__CSS__*/
@@ -888,7 +991,10 @@ button.primary:disabled{opacity:.45;cursor:not-allowed}
 .pick-on .av:hover{background:var(--surface)}
 .av .v{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
 </style></head><body><div class="wrap">
-<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p><div id="seatbar"></div><div id="offline" class="offline"></div>
+<h1>Draft advisor</h1><p class="sub" id="sub">connecting...</p>
+<p class="note" style="margin:2px 0 0"><a href="/roast" target="_blank"
+ style="color:var(--accent)">Open the draft scorecard</a> &mdash; every pick
+ graded as it lands. It is not kind.</p><div id="seatbar"></div><div id="offline" class="offline"></div>
 <div id="main"></div></div>
 <script>
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1190,6 +1296,7 @@ def serve(state, host, port, open_browser=True, share=False,
     from report import CSS
     cards = [{k: st[k] for k in ("key", "label", "grade", "one", "detail",
                                  "verdict")} for st in strat_mod.STRATEGIES]
+    roast_page = ROAST_PAGE.replace("/*__CSS__*/", CSS).encode("utf-8")
     page = (PAGE.replace("/*__CSS__*/", CSS)
                 .replace("/*__STRATEGIES__*/", json.dumps(cards))
                 .encode("utf-8"))
@@ -1206,6 +1313,21 @@ def serve(state, host, port, open_browser=True, share=False,
             self.wfile.write(body)
 
         def do_GET(self):
+            if self.path.startswith("/api/scorecard"):
+                try:
+                    with state.lock:
+                        body = json.dumps(state.roast()).encode("utf-8")
+                except Exception as err:            # noqa: BLE001
+                    # The scorecard is entertainment; the draft board is not.
+                    # It fails to an error payload rather than a 500 so a bad
+                    # line can never look like the server going down.
+                    body = json.dumps({"error": f"{type(err).__name__}: {err}",
+                                       "rows": [], "standings": []}).encode()
+                self._send(200, body, "application/json")
+                return
+            if self.path.startswith("/roast"):
+                self._send(200, roast_page, "text/html; charset=utf-8")
+                return
             if self.path.startswith("/api/state"):
                 q = urllib.parse.parse_qs(
                     urllib.parse.urlparse(self.path).query)
