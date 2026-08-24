@@ -474,7 +474,9 @@ class DraftState:
                   "player": p.get("name"), "pos": p.get("pos"),
                   "user_id": uid_by_name.get(p["manager"], "")}
                  for p in self.picks]
-        rows, standings, _ = scorecard_mod.scorecard(picks, self.season)
+        # overrides=True only here: tonight's draft, not the history pages.
+        rows, standings, _ = scorecard_mod.scorecard(picks, self.season,
+                                                     overrides=True)
         return {"season": self.season, "picks": len(self.picks), "live": True,
                 "rows": rows, "best": [], "standings": standings,
                 "order_known": self.order_known, "seasons": PAST_SEASONS}

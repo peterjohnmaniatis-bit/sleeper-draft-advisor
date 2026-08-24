@@ -44,6 +44,17 @@ VALUE_SD = 1.0            # taken this far AFTER his ADP is genuine value
 # the night, which is both wrong and not funny.
 UNGRADED_POS = {"K", "DEF"}
 
+# One hardcoded verdict, by request. Keyed on the Sleeper player id rather than
+# the name, so a spelling variant or a name change cannot make it silently miss.
+# Live drafts only: a past year is judged on what was known at the time, and
+# this is judged on a puppet.
+OVERRIDES = {
+    "6904": {  # Jalen Hurts
+        "grade": "F",
+        "line": "You Drafted Jose Jalapeno you fucking idiot",
+    },
+}
+
 # What a reach COSTS depends on where it happens. Twelve picks early in round
 # two burns a starter; twelve picks early in round thirteen burns a bench flier
 # nobody will remember. Same standard deviations, wildly different crime, so
@@ -135,7 +146,7 @@ def _band_sd(a):
     return adp_mod.BANDS[-1][2]
 
 
-def score_pick(pick, market, grudges, seen_counts):
+def score_pick(pick, market, grudges, seen_counts, overrides=False):
     """Grade one completed pick. Returns None when ADP cannot price it.
 
     A player with no ADP is not a reach -- he is a player the market has no
@@ -144,6 +155,23 @@ def score_pick(pick, market, grudges, seen_counts):
     """
     pid = str(pick.get("player_id") or "")
     a = market.get(pid)
+    # Checked before every other gate, including the missing-ADP bail-out, so
+    # the joke cannot be defeated by the market having no opinion on him.
+    if overrides and pid in OVERRIDES:
+        o = OVERRIDES[pid]
+        over = (a - pick["pick_no"]) if a is not None else 0.0
+        return {
+            "pick_no": pick["pick_no"], "round": pick.get("round"),
+            "manager": pick.get("manager") or "somebody",
+            "player": pick.get("player") or "that guy",
+            "pos": pick.get("pos") or "?",
+            "adp": round(a, 1) if a is not None else None,
+            "over": round(over, 1), "sd_over": 9.9,
+            "grade": o["grade"], "repeat": True, "override": True,
+            # Pre-rendered: it never draws from the pool, so it can never be
+            # spent by another pick or knocked out by the token filter.
+            "line": o["line"], "_cat": None, "_ctx": None,
+        }
     if a is None or a > adp_mod.ADP_HORIZON:
         return None
     if (pick.get("pos") or "") in UNGRADED_POS:
@@ -251,7 +279,8 @@ def repeat_context(pick, hist, sd_over, seen_counts):
     return None
 
 
-def scorecard(picks, season, grudges=None, worst=None, best=None):
+def scorecard(picks, season, grudges=None, worst=None, best=None,
+              overrides=False):
     """Grade a draft. Returns (rows, standings).
 
     `worst` and `best` keep only the N ugliest and N sharpest picks. Standings
@@ -265,7 +294,7 @@ def scorecard(picks, season, grudges=None, worst=None, best=None):
     grudges = grudges if grudges is not None else load_grudges(before=season)
     rows, seen = [], {}
     for p in picks:
-        r = score_pick(p, market, grudges, seen)
+        r = score_pick(p, market, grudges, seen, overrides)
         if r:
             rows.append(r)
 
@@ -306,7 +335,11 @@ def scorecard(picks, season, grudges=None, worst=None, best=None):
     # wearing the same sentence.
     used = {}
     for r in shown + top:
-        r["line"] = pick_line(r.pop("_cat"), r["_ctx"], r["pick_no"],
+        cat = r.pop("_cat", None)
+        if cat is None:                 # an override carries its own sentence
+            r.pop("_ctx", None)
+            continue
+        r["line"] = pick_line(cat, r["_ctx"], r["pick_no"],
                               skip_tokens(r["_ctx"]), used)
         r.pop("_ctx", None)
     for r in rows:
