@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import adp as adp_mod
+import outcome as outcome_mod
 from scorecard_lines import LINES, pick_line
 
 ROOT = Path(__file__).resolve().parent
@@ -110,10 +111,15 @@ def past_picks(season):
         for p in json.loads(Path(files[0]).read_text(encoding="utf-8")):
             if p.get("pick_no"):
                 ids[p["pick_no"]] = str(p.get("player_id") or "")
+    # points / surplus / value_rank ride along so a completed season can be
+    # judged on what it returned, not only on what it cost. The live feed has
+    # none of these, which is exactly why outcomes are off by default.
     return [{"pick_no": d["pick_no"], "round": d.get("round"),
              "manager": d.get("manager"), "player": d.get("player"),
              "pos": d.get("position"), "user_id": str(d.get("user_id") or ""),
-             "player_id": ids.get(d["pick_no"], "")}
+             "player_id": ids.get(d["pick_no"], ""),
+             "points": d.get("points"), "surplus": d.get("surplus"),
+             "value_rank": d.get("value_rank")}
             for d in yr["draft"]]
 
 
@@ -136,6 +142,36 @@ def grade_for(sd_over):
 
 
 GPA = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "F": 0.0}
+
+
+def outcome_grade(miss, teams=12):
+    """Grade what a pick actually returned, in ROUNDS missed by.
+
+    Rank units are meaningless on their own -- missing by 40 places is a
+    catastrophe at pick 3 and arithmetically impossible at pick 170 -- so the
+    miss is expressed in rounds, which self-damps: a late pick simply cannot
+    fall very far because there is not much board left beneath him.
+    """
+    r = miss / teams
+    if r <= -1.0:
+        return "A"
+    if r <= 0.5:
+        return "B"
+    if r <= 2.0:
+        return "C"
+    if r <= 4.0:
+        return "D"
+    return "F"
+
+
+def combine(process, outcome_g):
+    """Half how you bought, half what you got. Rounded toward the worse of the
+    two, because a scorecard that rounds in your favour is not a scorecard."""
+    pts = (GPA[process] + GPA[outcome_g]) / 2.0
+    for letter in ("A", "B", "C", "D"):
+        if pts >= GPA[letter] - 0.25:
+            return letter
+    return "F"
 
 
 def _band_sd(a):
@@ -280,7 +316,7 @@ def repeat_context(pick, hist, sd_over, seen_counts):
 
 
 def scorecard(picks, season, grudges=None, worst=None, best=None,
-              overrides=False):
+              overrides=False, outcomes=False):
     """Grade a draft. Returns (rows, standings).
 
     `worst` and `best` keep only the N ugliest and N sharpest picks. Standings
@@ -297,6 +333,34 @@ def scorecard(picks, season, grudges=None, worst=None, best=None,
         r = score_pick(p, market, grudges, seen, overrides)
         if r:
             rows.append(r)
+
+    # What the pick actually returned. Completed seasons only -- there is no
+    # outcome for a draft that has not been played, and pretending otherwise
+    # would grade tonight on a coin that has not landed.
+    if outcomes:
+        played = outcome_mod.games_played(season)
+        full = outcome_mod.season_length(played)
+        by_pick = {p["pick_no"]: p for p in picks}
+        for r in rows:
+            if r.get("override"):
+                continue
+            src = by_pick.get(r["pick_no"]) or {}
+            j = outcome_mod.judge(src, played.get(str(src.get("player_id") or ""), 0),
+                                  full)
+            if not j:
+                continue
+            r["outcome"] = j
+            if j["shaded"]:
+                # He was unavailable but producing. The process grade stands
+                # alone: you are answerable for what you paid, not for a
+                # hamstring.
+                r["grade_outcome"] = None
+                r["shaded"] = True
+            else:
+                og = outcome_grade(j["miss"])
+                r["grade_outcome"] = og
+                r["grade_process"] = r["grade"]
+                r["grade"] = combine(r["grade"], og)
 
     by_mgr = {}
     for r in rows:

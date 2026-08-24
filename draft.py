@@ -459,8 +459,11 @@ class DraftState:
         # A past season is graded from the cache, not from tonight's feed.
         if season and str(season) != str(self.season):
             picks = scorecard_mod.past_picks(season)
+            # outcomes=True only for a finished season: the grade becomes half
+            # what you paid and half what you got, with injuries held against
+            # nobody.
             rows, standings, best = scorecard_mod.scorecard(
-                picks, str(season), worst=WORST_N, best=WORST_N)
+                picks, str(season), worst=WORST_N, best=WORST_N, outcomes=True)
             # The season list rides on every response, not just the live one:
             # a link straight to a past year would otherwise render with no way
             # back to tonight.
@@ -788,6 +791,9 @@ ROAST_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .ev .ln{margin:3px 0 0;font-size:15px;line-height:1.45}
 .ev .rec{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
   text-transform:uppercase;color:var(--neg);margin-left:6px}
+.ev .shd{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--accent);margin-left:6px}
+.ev.shaded{border-color:var(--accent)}
 .tbl{width:100%;border-collapse:collapse;font-size:14px;
   font-variant-numeric:tabular-nums;margin-top:10px}
 .tbl th{text-align:left;font-size:11px;text-transform:uppercase;
@@ -822,8 +828,15 @@ noise and reaching there costs nothing. Late rounds are damped, because twelve
 picks early in round two burns a starter and twelve picks early in round
 thirteen burns nobody. Receipts come from five seasons of this league, and a past draft is
 judged only on what had already happened by then. Past years show their ten
-ugliest picks; the standings above them are computed over the whole draft.
-No line is ever used twice.</p>
+ugliest and ten sharpest picks; the standings above them are computed over the
+whole draft. No line is ever used twice.</p>
+<p class="note">A finished season is graded half on what the pick COST against
+the market and half on what it RETURNED. A player who missed most of the year
+but produced whenever he played is marked <b>injury</b> and his outcome is not
+counted &mdash; you are answerable for what you paid, not for a hamstring.
+Games played cannot say WHY someone was absent, so a holdout or a benching
+reads the same as a torn ligament; pairing it with per-game production catches
+most of that, and anyone who played and was simply bad is still blamed.</p>
 </div>
 <script>
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -833,11 +846,16 @@ function feed(rows, newestFirst){
     'defences do not count, and neither does anyone the market has no opinion '+
     'about.</p>';
   return '<div class="feed">'+(newestFirst ? rows.slice().reverse() : rows).map(function(r){
-    return '<div class="ev'+(r.repeat?' rep':'')+'">'+
+    return '<div class="ev'+(r.shaded?' shaded':(r.repeat?' rep':''))+'">'+
       '<span class="gr '+r.grade+'">'+r.grade+'</span>'+
       '<div class="bd"><div class="hd">R'+r.round+' pick '+r.pick_no+' &middot; '+
         '<b>'+esc(r.manager)+'</b> &middot; '+esc(r.player)+' ('+esc(r.pos)+') '+
         '&middot; adp '+r.adp+
+        (r.outcome
+          ? ' &middot; finished '+r.outcome.finished+' &middot; '+
+            r.outcome.games+'/'+r.outcome.full+' games'
+          : '')+
+        (r.shaded?'<span class="shd">injury &mdash; not counted</span>':'')+
         (r.repeat?'<span class="rec">receipts</span>':'')+'</div>'+
       '<p class="ln">'+esc(r.line)+'</p></div></div>';
   }).join('')+'</div>';

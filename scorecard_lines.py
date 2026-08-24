@@ -356,7 +356,15 @@ def _ordinals(text):
         else:
             suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
         return f"{n}{suf}"
-    return _re.sub(r"\b(\d+)th\b", sub, text)
+    text = _re.sub(r"\b(\d+)th\b", sub, text)
+    # Counts arrive as bare numbers, so a manager who did something once was
+    # being told he had done it "1 times".
+    text = _re.sub(r"\b1 times\b", "once", text)
+    text = _re.sub(r"\b1 (picks|rounds|years|seasons|spots|managers)\b",
+                   lambda m: "1 " + m.group(1)[:-1], text)
+    text = _re.sub(r"\b1 (reaches|offenses|offences)\b",
+                   lambda m: "1 " + m.group(1)[:-2], text)
+    return text
 
 
 def pick_line(cat, ctx, seed, skip=(), used=None):
