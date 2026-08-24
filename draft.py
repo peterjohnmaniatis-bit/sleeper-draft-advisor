@@ -830,13 +830,17 @@ thirteen burns nobody. Receipts come from five seasons of this league, and a pas
 judged only on what had already happened by then. Past years show their ten
 ugliest and ten sharpest picks; the standings above them are computed over the
 whole draft. No line is ever used twice.</p>
-<p class="note">A finished season is graded half on what the pick COST against
-the market and half on what it RETURNED. A player who missed most of the year
-but produced whenever he played is marked <b>injury</b> and his outcome is not
-counted &mdash; you are answerable for what you paid, not for a hamstring.
-Games played cannot say WHY someone was absent, so a holdout or a benching
-reads the same as a torn ligament; pairing it with per-game production catches
-most of that, and anyone who played and was simply bad is still blamed.</p>
+<p class="note">A finished season is graded on <b>where a player was taken at
+his position against where he finished at it</b>. The third back off the board
+is expected to be RB3; finishing RB19 is the miss, and finishing RB1 is the
+steal. Position pools are used deliberately: quarterbacks outscore everyone by
+construction, so ranking on overall points returns a &ldquo;best picks&rdquo;
+list that is nothing but quarterbacks and says nothing about drafting. Reaching
+past a player&rsquo;s market price is not penalised separately here &mdash;
+paying up moves your own slot earlier and so raises the bar you are measured
+against, and a reach that lands is a read the market did not have, not a
+mistake. Players who missed the season are removed from these pages entirely;
+you cannot grade a pick on a year that never happened.</p>
 </div>
 <script>
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -851,11 +855,10 @@ function feed(rows, newestFirst){
       '<div class="bd"><div class="hd">R'+r.round+' pick '+r.pick_no+' &middot; '+
         '<b>'+esc(r.manager)+'</b> &middot; '+esc(r.player)+' ('+esc(r.pos)+') '+
         '&middot; adp '+r.adp+
-        (r.outcome
-          ? ' &middot; finished '+r.outcome.finished+' &middot; '+
-            r.outcome.games+'/'+r.outcome.full+' games'
-          : '')+
-        (r.shaded?'<span class="shd">injury &mdash; not counted</span>':'')+
+        (r.outcome && r.outcome.pos_taken
+          ? ' &middot; taken '+esc(r.pos)+r.outcome.pos_taken+
+            ' &rarr; finished '+esc(r.pos)+r.outcome.pos_rank
+          : (r.outcome ? ' &middot; finished '+r.outcome.finished : ''))+
         (r.repeat?'<span class="rec">receipts</span>':'')+'</div>'+
       '<p class="ln">'+esc(r.line)+'</p></div></div>';
   }).join('')+'</div>';
@@ -865,14 +868,20 @@ function table(st){
   if(!st.length) return '';
   return '<h2>Standings, worst first</h2><table class="tbl">'+
     '<tr><th>Manager</th><th class="n">Picks</th><th class="n">GPA</th>'+
-    '<th class="n">Avg picks early</th><th>Worst crime</th></tr>'+
+    '<th class="n">Avg picks early</th><th>Worst pick</th></tr>'+
     st.map(function(m){
       const w = m.worst;
       return '<tr><td>'+esc(m.manager)+'</td><td class="n">'+m.picks+'</td>'+
         '<td class="n">'+m.gpa.toFixed(2)+'</td>'+
         '<td class="n">'+(m.mean_over>0?'+':'')+m.mean_over.toFixed(1)+'</td>'+
-        '<td>'+(w?esc(w.player)+' ('+(w.over>0?'+':'')+w.over.toFixed(0)+')':'&mdash;')+
-        '</td></tr>';
+        /* For a finished season the crime is the positional miss, not the ADP
+           gap -- showing "(+0)" beside a player who fell 35 places at his
+           position had the column contradicting the grade that ranked him. */
+        '<td>'+(w
+          ? esc(w.player)+(w.outcome && w.outcome.pos_taken
+              ? ' ('+esc(w.pos)+w.outcome.pos_taken+' &rarr; '+esc(w.pos)+w.outcome.pos_rank+')'
+              : ' ('+(w.over>0?'+':'')+w.over.toFixed(0)+')')
+          : '&mdash;')+'</td></tr>';
     }).join('')+'</table>';
 }
 

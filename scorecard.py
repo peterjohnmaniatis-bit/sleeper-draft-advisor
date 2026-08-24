@@ -273,9 +273,14 @@ def skip_tokens(ctx):
         out.append("late")
     if not ctx.get("over"):
         out.append("over")
-    for t in ("bust", "bust_yr", "bust_fin", "qb_yrs", "n"):
+    for t in ("bust", "bust_yr", "bust_fin", "qb_yrs", "n",
+              "finished", "miss", "beat"):
         if t not in ctx:
             out.append(t)
+    if not ctx.get("miss"):
+        out.append("miss")
+    if not ctx.get("beat"):
+        out.append("beat")
     return tuple(out)
 
 
@@ -334,33 +339,77 @@ def scorecard(picks, season, grudges=None, worst=None, best=None,
         if r:
             rows.append(r)
 
-    # What the pick actually returned. Completed seasons only -- there is no
-    # outcome for a draft that has not been played, and pretending otherwise
-    # would grade tonight on a coin that has not landed.
+    # A completed season is graded on DRAFT POSITION versus ACTUAL FINISH, and
+    # nothing else. The ADP reach is not a separate penalty here, because
+    # `finished - pick_no` already prices it: reaching moves your own slot
+    # earlier and so raises the bar you are measured against. Charging the gap
+    # again was double-counting, and it produced a genuinely wrong verdict --
+    # Davante Adams, taken 6 picks early at 38 in 2025, finished 25th, thirteen
+    # ahead of the slot he cost and nineteen ahead of the market, and the
+    # scorecard called it a C. A reach that lands is not a bad pick; it is a
+    # read the market did not have.
+    #
+    # Players who missed the season are dropped from the page entirely rather
+    # than shown with an asterisk. You cannot grade a pick on a year that never
+    # happened, and leaving them in with the outcome suppressed just filled the
+    # page with hedged non-verdicts.
     if outcomes:
         played = outcome_mod.games_played(season)
         full = outcome_mod.season_length(played)
         by_pick = {p["pick_no"]: p for p in picks}
+        # Where each pick sat, and finished, inside his own position pool.
+        pos_exp, pos_act = outcome_mod.positional(picks)
+        kept = []
         for r in rows:
             if r.get("override"):
+                kept.append(r)
                 continue
             src = by_pick.get(r["pick_no"]) or {}
             j = outcome_mod.judge(src, played.get(str(src.get("player_id") or ""), 0),
-                                  full)
+                                  full, pos_exp, pos_act)
             if not j:
-                continue
-            r["outcome"] = j
+                continue          # no outcome data: nothing to judge
             if j["shaded"]:
-                # He was unavailable but producing. The process grade stands
-                # alone: you are answerable for what you paid, not for a
-                # hamstring.
-                r["grade_outcome"] = None
-                r["shaded"] = True
+                continue          # missed the season: off the page
+            r["outcome"] = j
+            r["grade_process"] = r["grade"]
+            # miss is now in POSITIONAL places, a much tighter scale than
+            # overall rank: finishing 6 spots below your slot at your position
+            # is a real miss, where 6 overall was noise.
+            r["grade"] = outcome_grade(j["miss"], teams=3)
+            r["grade_outcome"] = r["grade"]
+            # Rank by how far the pick beat or missed its own slot, so the
+            # worst and best lists are about results rather than about ADP.
+            r["sd_over"] = j["miss"] / 3.0
+            # The sentence has to follow the VERDICT, not the reach. Adams was
+            # a reach and an A; handing him a brutal roast line because of the
+            # ADP gap would have the copy arguing with the grade beside it.
+            # Tokens the outcome copy speaks in. {beat} and {miss} are kept
+            # mutually exclusive so a line can never claim a gain on a loss.
+            r["_ctx"] = {**(r.get("_ctx") or {}),
+                         # Labelled with the position so the sentence cannot
+                         # mix scales: "went 5 and came back 25" reads as one
+                         # number type, when 5 is an overall pick and 25 is a
+                         # positional finish. "came back WR25" is unambiguous.
+                         "finished": (f"{r['pos']}{j['pos_rank']}"
+                                      if j.get("pos_rank") else j["finished"]),
+                         "miss": max(0, j["miss"]),
+                         "beat": max(0, -j["miss"])}
+            # Outcome copy, not reach copy. These lines speak in slot-versus-
+            # finish, which is what the historical grade now measures; the
+            # reach library would have the sentence arguing with the letter
+            # beside it.
+            m = j["miss"]
+            if m >= 20:
+                r["_cat"] = "outcome-disaster"
+            elif m > 3:
+                r["_cat"] = "outcome-miss"
+            elif m <= -20:
+                r["_cat"] = "outcome-steal"
             else:
-                og = outcome_grade(j["miss"])
-                r["grade_outcome"] = og
-                r["grade_process"] = r["grade"]
-                r["grade"] = combine(r["grade"], og)
+                r["_cat"] = "outcome-hit"
+            kept.append(r)
+        rows = kept
 
     by_mgr = {}
     for r in rows:

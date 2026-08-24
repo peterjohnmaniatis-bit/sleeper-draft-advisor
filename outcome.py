@@ -81,7 +81,41 @@ def season_length(games):
     return max(games.values(), default=17) or 17
 
 
-def judge(pick, played, full):
+def positional(picks):
+    """Where each pick was taken, and where he finished, WITHIN HIS POSITION.
+
+    Overall points rank is useless for grading a draft. Quarterbacks simply
+    score more, so an overall list of the best picks in any season comes back
+    all quarterbacks -- which is an artefact of scoring, not a read on anyone's
+    drafting. Measured against the alternatives that actually existed at his
+    position, a QB taken 20th at the position and finishing 6th is a steal, and
+    a QB taken 2nd who finishes 6th is a mild miss, even though the second one
+    scored more points.
+
+    Expected positional rank is simply the order the position came off the
+    board: the third running back drafted is expected to be RB3. Actual is his
+    points rank among the backs drafted that year, so a pick is judged against
+    the men his manager could have had instead.
+    """
+    order, scored = {}, {}
+    for p in sorted(picks, key=lambda x: x.get("pick_no") or 0):
+        pos = p.get("pos") or p.get("position")
+        if not pos:
+            continue
+        order.setdefault(pos, []).append(p["pick_no"])
+        scored.setdefault(pos, []).append((p.get("points") or 0.0, p["pick_no"]))
+
+    exp, act = {}, {}
+    for pos, picknos in order.items():
+        for i, pk in enumerate(picknos, 1):
+            exp[pk] = i
+        for i, (_pts, pk) in enumerate(
+                sorted(scored[pos], key=lambda t: -t[0]), 1):
+            act[pk] = i
+    return exp, act
+
+
+def judge(pick, played, full, pos_exp=None, pos_act=None):
     """Did it work, and is the manager answerable for it?
 
     Returns a dict, or None when there is nothing to judge (no outcome data).
@@ -101,9 +135,16 @@ def judge(pick, played, full):
     exp_ppg = (expected / full) if full else 0.0
     rate = (ppg / exp_ppg) if exp_ppg > 0 else 1.0
 
-    # Finishing far below where he was taken is the failure; how far is the
-    # size of it. Positive = fell short.
-    miss = rank - pick_no
+    # Finishing below where he was taken is the failure; how far is the size of
+    # it. Positive = fell short. Measured WITHIN THE POSITION where that is
+    # available, so the grade is not skewed by quarterbacks outscoring
+    # everybody by construction.
+    if pos_exp and pos_act and pick_no in pos_exp and pick_no in pos_act:
+        pos_rank, pos_taken = pos_act[pick_no], pos_exp[pick_no]
+        miss = pos_rank - pos_taken
+    else:
+        pos_rank = pos_taken = None
+        miss = rank - pick_no
 
     shaded = miss > 0 and (
         availability <= UNJUDGEABLE
@@ -114,6 +155,7 @@ def judge(pick, played, full):
         "ppg": round(ppg, 1), "exp_ppg": round(exp_ppg, 1),
         "rate": round(rate, 2),
         "finished": rank, "miss": miss,
+        "pos_rank": pos_rank, "pos_taken": pos_taken,
         "blame": not shaded,
         "shaded": shaded,
     }
