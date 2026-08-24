@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from model import RAW, Players, Season, _load, replacement_ranks
+import adp as adp_mod
 from trade import REPLACEMENT_RANK, replacement_levels, season_projections
 
 ROOT = Path(__file__).resolve().parent
@@ -81,6 +82,10 @@ def build_board(season, players):
     """Every projected player, ranked by value over replacement."""
     proj = season_projections(season)
     levels = replacement_levels(proj, players, DRAFT_REPLACEMENT)
+    # What the market charges, alongside what he is worth. Same cached file,
+    # no extra network call. Missing for deep bench players, which is why every
+    # consumer treats None as "unknown" rather than as a number.
+    market = adp_mod.load(season)
     board = []
     for pid, pts in proj.items():
         pos = players.position(pid)
@@ -89,10 +94,14 @@ def build_board(season, players):
         board.append({
             "player_id": pid, "name": players.name(pid), "pos": pos,
             "proj": round(pts, 1), "vor": round(pts - levels[pos], 1),
+            "adp": market.get(pid),
         })
     board.sort(key=lambda p: -p["vor"])
     for i, p in enumerate(board, 1):
         p["rank"] = i
+        # Positive: the market rates him lower than we do, so he can be had
+        # later than his value suggests. Negative: he goes before we rank him.
+        p["adp_gap"] = adp_mod.gap(p["adp"], i)
     return board, levels
 
 
@@ -185,6 +194,23 @@ def survival(queue_rank, picks_until_next, league_norm, rnd, pos):
     return _poisson_below(queue_rank, lam)
 
 
+def survival_for(p, queue_rank, picks_until_next, league_norm, rnd, next_pick):
+    """Chance he lasts to your next pick, preferring the market model.
+
+    The queue model asks "how many players at this position must come off the
+    board first", counting from OUR ranking. That is exactly wrong for a player
+    the rest of the world rates very differently: we may have him third at his
+    position while the market has him thirtieth, and he is then in no danger at
+    all. ADP measures the market directly, so it is used whenever it exists and
+    the queue model stays as the fallback for players it does not cover.
+    """
+    if picks_until_next > 0:
+        s = adp_mod.survival(p.get("adp"), next_pick)
+        if s is not None:
+            return s, "adp"
+    return survival(queue_rank, picks_until_next, league_norm, rnd, p["pos"]), "queue"
+
+
 def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
               limit=6):
     """Rank the available players for this pick."""
@@ -197,7 +223,8 @@ def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
             continue
         queue[p["pos"]] += 1
         ok, note, kind = directive_check(p["pos"], rnd, counts)
-        surv = survival(queue[p["pos"]], picks_until_next, league_norm, rnd, p["pos"])
+        surv, surv_src = survival_for(p, queue[p["pos"]], picks_until_next,
+                                      league_norm, rnd, pick_no + picks_until_next)
         # Value you would lose by waiting. Clamped at zero because the term is
         # multiplicative in VOR: left unclamped, scarcity makes a NEGATIVE-value
         # player score worse, so late in the draft it ranks the scarce player
@@ -205,7 +232,7 @@ def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
         urgency = max(0.0, p["vor"]) * (1.0 - surv)
         score = p["vor"] + urgency * 0.5 - (0 if ok else 10_000)
         out.append({**p, "allowed": ok, "note": note, "block_kind": kind,
-                    "survives": round(surv * 100),
+                    "survives": round(surv * 100), "surv_src": surv_src,
                     "score": round(score, 1)})
         if len(out) > 260:
             break
@@ -213,6 +240,30 @@ def recommend(board, taken, roster, rnd, pick_no, picks_until_next, league_norm,
     allowed = [p for p in out if p["allowed"]][:limit]
     blocked = [p for p in out if not p["allowed"]][:2]
     return allowed, blocked
+
+
+def wait_advice(allowed, next_pick, safe=60, gone=25):
+    """The whole point of knowing the market: do not spend this pick on a
+    player the market will leave sitting there.
+
+    Fires only when the top recommendation is likely to survive to your next
+    pick AND something else on the list is likely not to. Both halves matter --
+    "you can wait" is useless advice unless there is something worth taking
+    instead. Silent when ADP does not cover the player, because the fallback
+    queue model is not accurate enough to tell someone to pass on a pick.
+    """
+    if not allowed or not next_pick:
+        return None
+    top = allowed[0]
+    if top.get("surv_src") != "adp" or top["survives"] < safe:
+        return None
+    alt = next((r for r in allowed[1:]
+                if r.get("surv_src") == "adp" and r["survives"] <= gone), None)
+    if not alt:
+        return None
+    return (f"{top['name']} is {top['survives']}% to last to pick {next_pick}; "
+            f"{alt['name']} is {alt['survives']}%. Consider taking {alt['name']} "
+            f"now and {top['name']} later.")
 
 
 def directive_cost(allowed, blocked):
@@ -387,12 +438,14 @@ class DraftState:
             best = max(r["vor"] for r in allowed)
             for r in allowed:
                 r["cost"] = round(max(0.0, best - r["vor"]), 1)
+        wait = wait_advice(allowed, nxt)
         return {
             "done": False, "pick_no": pk, "round": rnd, "slot": slot,
             "on_clock": on_clock, "my_turn": slot == self.slot,
             "picks_until_next": gap,
             "recommend": allowed, "blocked": blocked,
             "warn": directive_cost(allowed, blocked),
+            "wait": wait,
             "roster": [self.by_id.get(p, {"name": self.players.name(p), "pos": "?",
                                           "vor": 0}) for p in mine],
             "counts": dict(counts),
@@ -427,13 +480,19 @@ def run_mock(state, rng, verbose=True):
                 print(f"\n  --- YOUR PICK  (round {rnd}, pick {pk}) ---")
                 print(f"      next pick in {adv['picks_until_next']} selections")
                 for i, r in enumerate(adv["recommend"][:4], 1):
+                    a = r.get("adp")
+                    adp_s = "  -  " if a is None else f"{a:>5.1f}"
+                    back = ("?" if r.get("surv_src") == "queue" and a is None
+                            else f"{r['survives']}%")
                     print(f"      {i}. {r['name']:<24}{r['pos']:<4}"
                           f"VOR {r['vor']:>6.0f}  costs {r['cost']:>5.0f}  "
-                          f"board #{r['rank']:<5}back {r['survives']}%")
+                          f"board #{r['rank']:<5}adp {adp_s}  back {back:>4}")
                 for b in adv["blocked"]:
                     print(f"      x  {b['name']:<24}{b['pos']:<4}{b['note']}")
                 if adv["warn"]:
                     print(f"      !! {adv['warn']}")
+                if adv.get("wait"):
+                    print(f"      >> {adv['wait']}")
                 print(f"      -> taking {choice['name']} ({choice['pos']})")
             if not choice:
                 break
@@ -552,6 +611,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .rec .nm{font-weight:600;flex:1}
 .rec .pos{font-size:12px;color:var(--muted);width:32px}
 .rec .num{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:13px}
+.wait-tip{background:var(--surface);border:1px solid var(--accent);
+  color:var(--ink);padding:10px 14px;border-radius:8px;margin-bottom:8px;font-size:14px}
 .warn{background:var(--neg);color:#fff;padding:10px 14px;border-radius:8px;
       font-weight:600;margin:10px 0}
 .turn{background:var(--accent);color:#fff;padding:14px 16px;border-radius:10px;
@@ -660,6 +721,7 @@ async function tick(){
     '<span class="num">VOR '+r.vor.toFixed(0)+'</span>'+
     '<span class="num">'+(r.cost>0?'costs '+r.cost.toFixed(0):'best')+'</span>'+
     '<span class="num">#'+r.rank+'</span>'+
+    '<span class="num">'+(r.adp==null?'adp -':'adp '+r.adp.toFixed(1))+'</span>'+
     '<span class="num">'+r.survives+'% back</span>'+
     '<span class="go">take</span></div>').join('');
   const blocked = s.blocked.map(b=>
@@ -684,6 +746,7 @@ async function tick(){
                  : '<div class="wait">'+esc(s.on_clock)+' is picking. You are up in '+
                    s.picks_until_next+'.</div>')+
     (s.warn ? '<div class="warn">'+esc(s.warn)+'</div>' : '')+
+    (s.wait ? '<div class="wait-tip">'+esc(s.wait)+'</div>' : '')+
     '<div class="grid"><div><h2>Take one of these</h2>'+rec+blocked+'</div>'+
     '<div><h2>Your roster</h2><div>'+(roster||'<span class="sub">empty</span>')+
     '</div><h2>Recent picks</h2>'+recent+'</div></div>'+
