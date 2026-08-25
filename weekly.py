@@ -10,9 +10,10 @@ wrote no file at all. This one is built the other way round -- it always
 renders, and each section either shows what it knows or says plainly why it
 cannot know it yet.
 
-That ordering matters for this league specifically. 58.7% of all waiver value
-ever created here arrived in weeks 1-6, and 21.5% in weeks 1-2, which is
-exactly the window the old page was blind through.
+Recomputed over all 1,052 acquisitions: weeks 1-2 hold 15.2% of waiver value,
+weeks 1-6 hold 45.8%, and weeks 11+ hold 25.2% -- not the front-loaded picture
+an earlier pass claimed. Being useful in week 1 still matters, but because the
+roster needs work in week 1, not because the wire dries up later.
 """
 
 import argparse
@@ -31,6 +32,23 @@ POS_ORDER = ("RB", "WR", "TE", "QB", "K", "DEF")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+
+# Sleeper keeps the IR slot in settings.reserve_slots, NOT in roster_positions,
+# which is why every tool here has been blind to it. It matters: a PUP or IR
+# player parked there frees a bench spot, so the number of drops a roster needs
+# is not simply (players - slots).
+def reserve_info(st, players, rid, raw):
+    lg = _load(f"{st.season}/league.json") or {}
+    slots = int((lg.get("settings") or {}).get("reserve_slots") or 0)
+    ELIGIBLE = {"ir", "pup", "out", "doubtful", "sus", "suspended"}
+    cands = []
+    for pid in st.rosters.get(rid, []):
+        inj = ((raw.get(pid) or {}).get("injury_status") or "").lower()
+        if inj in ELIGIBLE:
+            cands.append({"name": players.name(pid), "pos": players.position(pid),
+                          "status": inj.upper()})
+    return slots, cands
 
 
 def legality(st, players, rid):
@@ -52,7 +70,7 @@ def legality(st, players, rid):
 
 
 def build(st, players, me, holes, have, wire_rows, weight, week, bye_rows,
-          playoff):
+          playoff, guaranteed, reserve):
     p = ['<div class="wrap">']
     p.append(f"<h1>Week {week}</h1>")
     played = len(st.weeks)
@@ -61,7 +79,18 @@ def build(st, players, me, holes, have, wire_rows, weight, week, bye_rows,
              f'{len(st.remaining_weeks())} regular-season weeks left &middot; '
              f'playoffs start week {playoff}</p>')
 
-    # -- the only certain loss on the board
+    # -- guaranteed zeros first, then merely-empty slots. An empty K is a
+    # problem you will obviously solve before Sunday; a bye week with no backup
+    # at the position is one you will not notice until it has already cost you.
+    if guaranteed:
+        p.append('<h2>Guaranteed zeros ahead</h2>')
+        p.append('<p class="sub">You roster exactly one player at these '
+                 'positions and he has a bye. Nothing on the roster can cover '
+                 'it, so the slot scores zero unless you add someone first.</p>')
+        p.append(table(["Position", "#Week", "Player on bye"],
+                       [[esc(g["pos"]), str(g["week"]), esc(g["name"])]
+                        for g in guaranteed]))
+
     if holes:
         p.append('<h2>Your lineup is not legal</h2>')
         need = ", ".join(f"{n} {pos}" for pos, n in sorted(holes.items()))
@@ -70,6 +99,21 @@ def build(st, players, me, holes, have, wire_rows, weight, week, bye_rows,
                  f'is filled &mdash; across this league&rsquo;s history, teams '
                  f'started a kicker in 839 of 840 games and a defence in all '
                  f'840.</p>')
+        r_slots, r_cands = reserve
+        adds = sum(holes.values())
+        spare = max(0, len(st.roster_slots()) + 5 - len(st.rosters.get(me, [])))
+        drops = max(0, adds - spare)
+        if r_slots and r_cands and drops:
+            names = ", ".join(f'{esc(c["name"])} ({esc(c["status"])})'
+                              for c in r_cands)
+            p.append(f'<p class="note">You need {adds} add'
+                     f'{"" if adds == 1 else "s"} and have {drops} spare '
+                     f'spot{"" if drops == 1 else "s"} &mdash; but this league '
+                     f'carries {r_slots} IR slot, which is in the league '
+                     f'settings and not in the roster list, so no tool here '
+                     f'has ever counted it. Currently eligible: {names}. '
+                     f'Parking one there buys back a spot and reduces the '
+                     f'drops by one.</p>')
         for pos in sorted(holes):
             rows = (wire_rows.get(pos) or [])[:5]
             if rows:
@@ -171,8 +215,25 @@ def main():
         for w in sorted(weeks):
             bye_rows.append((w, byes_mod.starters_lost(weeks[w], slots), weeks[w]))
 
+    # A position is a guaranteed zero when the roster holds exactly one of it
+    # and he has a bye. Ranked above the empty K/DEF slots deliberately: an
+    # empty mandatory slot is obvious and will be filled tonight, whereas this
+    # sits eight weeks away and nothing else surfaces it.
+    import json as _json
+    raw = _json.loads((ROOT / "data" / "raw" / "players_nfl.json").read_text(encoding="utf-8"))
+    held = defaultdict(list)
+    for pid in st.rosters.get(me, []):
+        held[players.position(pid)].append(pid)
+    guaranteed = []
+    for w, _h, plist in bye_rows:
+        for x in plist:
+            if len(held.get(x["pos"], [])) == 1:
+                guaranteed.append({"pos": x["pos"], "week": w, "name": x["name"]})
+    guaranteed.sort(key=lambda g: g["week"])
+    reserve = reserve_info(st, players, me, raw)
+
     body = build(st, players, me, holes, have, wire_rows, weight, week,
-                 bye_rows, st.playoff_start)
+                 bye_rows, st.playoff_start, guaranteed, reserve)
     title = f"Week {week} &mdash; {st.season}"
     if a.fragment:
         doc = f"<title>{title}</title><style>{CSS}</style>{body}"

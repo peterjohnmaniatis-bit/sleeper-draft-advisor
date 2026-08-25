@@ -16,7 +16,7 @@ import season as season_mod
 from advise import (lineup_call, trade_targets, trending, waivers,
                     week_projections)
 from model import Players, replacement_ranks
-from odds import bye_count, league_spots, simulate
+from odds import OddsUnavailable, bye_count, league_spots, simulate
 from report import CSS, esc, table
 from trade import replacement_levels, season_projections
 from usage import usage
@@ -122,6 +122,10 @@ def build(st, players, use, groups, need, odds_rows, lineup, partners, thin,
 
     # -- odds
     p.append("<h2>Playoff odds</h2>")
+    if not odds_rows:
+        p.append('<p class="sub">Not enough of the season has been played to '
+                 'simulate anything honestly. Two scored weeks is the minimum, '
+                 'and the numbers stay soft until about week six.</p>')
     p.append(f'<p class="sub">Every remaining matchup replayed {sims:,} times, '
              f'drawing each team&rsquo;s score from a mean shrunk toward the '
              f'league average and a spread widened for how few games it rests '
@@ -220,7 +224,14 @@ def main():
     me, groups, need = waivers(st, players, use, trend)
     spots = league_spots(st, args.spots)
     bye = bye_count(spots)
-    odds_rows = simulate(st, args.sims, spots)
+    # One section failing must not take the page with it. This used to raise
+    # SystemExit -- a BaseException -- so nothing caught it and week 1 wrote no
+    # file at all.
+    try:
+        odds_rows = simulate(st, args.sims, spots)
+    except OddsUnavailable as err:
+        print(f"  playoff odds unavailable: {err}")
+        odds_rows = []
     proj = week_projections(st.season, nxt)
     lineup = lineup_call(st, players, nxt, proj) if proj else (None, [], [])
     sp = season_projections(st.season)

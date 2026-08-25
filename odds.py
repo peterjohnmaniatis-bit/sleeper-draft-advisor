@@ -27,6 +27,23 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
+class OddsUnavailable(Exception):
+    """Not enough season yet to simulate.
+
+    A normal exception, deliberately: this used to be SystemExit, which is a
+    BaseException, so `except Exception` in dashboard.py never caught it and the
+    whole page died rather than the one section that could not be computed.
+    """
+
+
+class NoSchedule(OddsUnavailable):
+    pass
+
+
+class NotEnoughGames(OddsUnavailable):
+    pass
+
+
 def league_spots(st, override=None):
     """How many teams actually make this league's playoffs.
 
@@ -59,12 +76,12 @@ def simulate(st, sims=10000, playoff_spots=6, seed=7):
     remaining = [(wk, st.schedule.get(wk, {})) for wk in st.remaining_weeks()]
     games = sum(len(p) for _, p in remaining) // 2
     if not remaining or games == 0:
-        raise SystemExit(
+        raise NoSchedule(
             "No remaining schedule is cached, so there is nothing to simulate. "
             "Run: python pull.py --user <name>, or pass --through below the "
             "last played week.")
     if max((len(v) for v in st.scores.values()), default=0) < 2:
-        raise SystemExit(
+        raise NotEnoughGames(
             "Fewer than two scored weeks: there is no spread to draw from yet.")
 
     made = defaultdict(int)
@@ -205,7 +222,10 @@ def main():
     print(f"simulating {args.sims:,} seasons, top {spots} make the playoffs{bye_txt}")
     print()
 
-    rows = simulate(st, args.sims, spots)
+    try:
+        rows = simulate(st, args.sims, spots)
+    except OddsUnavailable as err:
+        raise SystemExit(str(err))
     needs = clinch_needs(st, rows, playoff_spots=spots) if args.clinch else {}
 
     cols = ["manager", "rec", "playoff%"] + (["bye%"] if nbye else []) + \
