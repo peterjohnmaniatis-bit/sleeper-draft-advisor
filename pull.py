@@ -112,6 +112,19 @@ def pull_league(league, refresh):
                f"league/{lid}/transactions/{week}", force)
 
 
+def pull_state():
+    """Sleeper's own view of where the NFL season is.
+
+    The authority on "what week is it". Inferring the week from whether anyone
+    has scored cannot tell Thursday night from a finished Sunday, and a
+    scheduled job would publish that mistake unattended.
+    """
+    data = get("state/nfl")
+    if data:
+        (RAW / "state.json").write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
 def pull_players(refresh):
     """The full NFL player dictionary, ~5MB. Sleeper asks that this be fetched
     at most once per day, so it gets its own staleness rule."""
@@ -157,6 +170,10 @@ def main():
 
     print("  players/nfl ...")
     pull_players(args.refresh)
+    st = pull_state()
+    if st:
+        print(f"  NFL state: {st.get('season')} {st.get('season_type')} "
+              f"week {st.get('week')}")
 
     index["seasons"].sort(key=lambda s: s["season"])
     (RAW / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")

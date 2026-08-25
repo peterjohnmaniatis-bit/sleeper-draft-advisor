@@ -159,14 +159,40 @@ class Season:
     def display(self, roster_id):
         return self.managers.get(roster_id, {}).get("display_name", f"roster {roster_id}")
 
-    def scored_weeks(self):
-        """Regular-season weeks where at least one team actually scored. Guards
-        against trailing empty weeks in an in-progress season."""
+    def scored_weeks(self, partial=False):
+        """Regular-season weeks that are actually COMPLETE.
+
+        Completion comes from Sleeper's own NFL state, not from whether anyone
+        has scored. Points-based inference cannot tell Thursday night from a
+        finished Sunday -- between kickoff and Monday night it reported the
+        in-progress week as done, advised the wrong week and fabricated a
+        record. On screen that is catchable; in a scheduled job it is not.
+
+        `partial=True` includes the week in progress, which is what a live
+        view wants. Anything computing a record, a mean or a spread does not.
+        """
+        cur = nfl_week()          # 0 outside the regular season
         out = []
         for w in self.regular_weeks:
-            if any((e.get("points") or 0) > 0 for e in self.weeks[w].values()):
+            if not any((e.get("points") or 0) > 0 for e in self.weeks[w].values()):
+                continue
+            if partial or not cur or w < cur:
                 out.append(w)
         return out
+
+
+def nfl_week():
+    """The regular-season week in progress, or 0 if it is not the season yet.
+
+    Read from the cached state file, so this stays a no-network module.
+    """
+    st = _load("state.json") or {}
+    if (st.get("season_type") or "").lower() != "regular":
+        return 0
+    try:
+        return int(st.get("week") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def load_all():

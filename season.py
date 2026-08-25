@@ -144,7 +144,13 @@ class LeagueState:
 
 
 def load(through=None, season=None):
-    """The newest season with played weeks, unless one is named."""
+    """The CURRENT season, unless one is named.
+
+    Deliberately not "the newest season with played weeks". In week zero that
+    rule silently handed every in-season tool last year's league -- correct
+    standings, correct rosters, entirely the wrong season -- and nothing on
+    screen said so.
+    """
     index = _load("index.json")
     if not index:
         raise SystemExit("No data. Run: python pull.py --user <name>")
@@ -154,13 +160,7 @@ def load(through=None, season=None):
         if not pick:
             raise SystemExit(f"No cached season {season}")
     else:
-        pick = None
-        for s in reversed(seasons):
-            st = LeagueState(s["season"], s["league_id"])
-            if st.weeks:
-                return st if through is None else LeagueState(
-                    s["season"], s["league_id"], through)
-        raise SystemExit("No season has any scored weeks yet")
+        pick = seasons[-1]        # the current season, played or not
     return LeagueState(pick["season"], pick["league_id"], through)
 
 
